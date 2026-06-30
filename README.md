@@ -8,23 +8,22 @@ human-readable clinical concept** (`Ā ≈ S Wᵀ`, with `S` fixed from CLIP and
 
 The goal here: given a classifier trained to grade fundus images into 7 disease classes,
 explain *which clinical findings* (microaneurysms, optic-disc cupping, drusen, …) drive
-its predictions — using a vocabulary a clinician would recognize.
+its predictions, using a vocabulary a clinician would recognize.
 
 ## What this fork changes vs. the original LGMD repo
 
 The method (CLIP maps `S`, the decomposition, ICE/CRAFT/FACE baselines, the Acc / C-Ins /
 MSE metrics) is unchanged. What's adapted for the medical domain:
 
-- **Dataset.** Local retinal-fundus images in `ImageFolder` layout (`<split>/<class>/*`),
-  not streamed ImageNet-1k. 7 disease classes (e.g. Cataract, Diabetic Retinopathy,
+- **Dataset.** Local retinal-fundus images in `ImageFolder` layout (`<split>/<class>/*`).
+- 7 disease classes (e.g. Cataract, Diabetic Retinopathy,
   Glaucoma, Hypertensive Retinopathy, Myopia, AMD, Normal) **resolved at runtime from the
-  train folder** — nothing is hardcoded, so the class list and index ordering can never
-  drift from the data (and match torchvision `ImageFolder`'s alphabetical ordering).
+  train folder**.
 - **The classifier is ours, and it's fine-tuned.** LGMD explains a *trained classifier*,
   so we fine-tune **ResNet-34** (ImageNet-initialized) to a 7-way fundus head on a
   subset of the train split — see [`src/train_backbone.py`](src/train_backbone.py). An
   ImageNet head would explain nothing about fundus disease.
-- **BiomedCLIP, not generic CLIP.** Concept maps come from **BiomedCLIP**
+- **BiomedCLIP** Concept maps come from **BiomedCLIP**
   (`microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224`, via `open_clip`), which
   understands clinical terminology. Generic CLIP ViT-B/16 is kept as a fallback
   (`CONFIG["clip_backend"] = "openai"`) for comparison.
