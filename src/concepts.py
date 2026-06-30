@@ -17,11 +17,21 @@ Filtering mirrors the supplementary material:
     cosine similarity below CONFIG["dedup_threshold"]. Result: exactly r concepts.
 """
 
+import hashlib
 import json
 import os
 import re
 
 from config import CONFIG, cache_name, resolve_vocab_key
+
+
+class InsufficientConcepts(RuntimeError):
+    """Raised when fewer than r concepts survive per-class filtering.
+
+    Subclasses RuntimeError so runner.run_all's ``except Exception`` skips the class
+    rather than aborting the whole run. Recover by adding candidates for the class
+    (``add_concepts``) and re-evaluating.
+    """
 
 
 def _canonical_key(name):
@@ -116,13 +126,23 @@ def _clip_select(concepts, clip, images, threshold, r):
         scores = text_emb @ proto                       # s_i = <t_i, mu_I>
         order.sort(key=lambda i: float(scores[i]), reverse=True)
 
-    kept, kept_emb = [], []
+    kept, kept_emb, deferred = [], [], []
     for i in order:
         emb = text_emb[i]
         if any(float(emb @ e) > threshold for e in kept_emb):   # near-duplicate in CLIP-text space
+            deferred.append(i)                          # keep as a relevance-ordered backup
             continue
         kept.append(concepts[i])
         kept_emb.append(emb)
+        if len(kept) == r:
+            return kept
+
+    # Diversity alone left us short of r (common when a class's concepts are all near-
+    # synonyms, e.g. cataract's many "haze / blur / opacity" phrasings collapse under the
+    # 0.80 dedup threshold). Rather than hard-fail, top up with the next-most-relevant
+    # deferred concepts so we still return r whenever the lexical pool is large enough.
+    for i in deferred:
+        kept.append(concepts[i])
         if len(kept) == r:
             break
     return kept
@@ -179,11 +199,68 @@ def get_concepts(clip, images=None):
     lexical = _lexical_filter(raw, cls)                     # stage 1 (suppl. A1.3)
     concepts = _clip_select(lexical, clip, images,         # stage 2 (suppl. A1.4)
                             CONFIG["dedup_threshold"], r)
-    if len(concepts) < r:
-        raise RuntimeError(f"Only {len(concepts)}/{r} concepts survived filtering; "
-                           f"add more candidates for '{cls}' in {CONFIG['concept_vocab_path']}.")
+    if not concepts or len(concepts) < r:
+        short = len(concepts)
+        msg = (f"only {short}/{r} concepts survived filtering for '{cls}' "
+               f"(lexical pool was {len(lexical)})")
+        # An empty pool is always fatal. A short-but-nonempty pool is skippable: when
+        # concept_skip_if_short is set (default), raise so a multi-class run records the
+        # class as a failure and moves on — then recover via add_concepts + re-evaluate.
+        if short == 0 or CONFIG.get("concept_skip_if_short", True):
+            raise InsufficientConcepts(
+                f"{msg[0].upper()}{msg[1:]}. Add more candidates for '{cls}' in "
+                f"{CONFIG['concept_vocab_path']} (e.g. concepts.add_concepts('{cls}', [...])) "
+                f"and re-evaluate.")
+        print(f"[warn] {msg}; proceeding with {short} "
+              f"(set CONFIG['concept_skip_if_short']=True to skip & recover instead).")
 
     with open(path, "w") as f:
         json.dump(concepts, f, indent=2)
     print(f"[cache] saved concepts.json ({len(concepts)} concepts)")
     return concepts
+
+
+def add_concepts(cls, new_concepts, vocab_path=None):
+    """Append candidate concepts for `cls` to the vocab table and refresh the cache key.
+
+    Recovery path for a class skipped with InsufficientConcepts: supply extra 2-4 word
+    clinical phrases (distinct enough to survive the CLIP dedup at CONFIG["dedup_threshold"]),
+    then re-run just that class with runner.run_all(['<cls>']).
+
+    New concepts are lowercased and de-duplicated against the class's existing entry, then
+    written back to concept_vocab.json (the entry is created if the class is new). The vocab
+    content hash in CONFIG is recomputed so every concept-keyed cache (concepts.json, S, W,
+    metrics) rebuilds on the next run instead of serving the stale, too-short result.
+    Returns the class's full updated candidate list.
+    """
+    path = vocab_path or CONFIG["concept_vocab_path"]
+    with open(path) as f:
+        table = json.load(f)
+
+    key = resolve_vocab_key(cls, table.keys()) or _canonical_key(cls)
+    existing = list(table.get(key, []))
+    seen = {(c["label"] if isinstance(c, dict) else c).strip().lower() for c in existing}
+
+    added = []
+    for c in new_concepts:
+        label = (c["label"] if isinstance(c, dict) else c).strip().lower()
+        if label and label not in seen:
+            seen.add(label)
+            existing.append(label)
+            added.append(label)
+    table[key] = existing
+
+    with open(path, "wb") as f:
+        blob = json.dumps(table, indent=2, ensure_ascii=False).encode()
+        f.write(blob)
+
+    # Recompute the content hash of the file we just wrote (cache_name's "con" group
+    # depends on it) so concept caches invalidate. Hashing `blob` directly — rather than
+    # config._vocab_hash(), which always reads the module-level default path — keeps this
+    # correct even when CONFIG["concept_vocab_path"] points elsewhere.
+    CONFIG["concept_vocab_hash"] = hashlib.md5(blob).hexdigest()[:8]
+    print(f"[vocab] '{key}': +{len(added)} new concept(s) (now {len(existing)} candidates); "
+          f"cache key refreshed. Re-evaluate with runner.run_all(['{cls}']).")
+    if not added:
+        print("[vocab] note: nothing added — all supplied concepts were already present.")
+    return existing

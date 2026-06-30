@@ -153,7 +153,11 @@ def aggregate(results):
 
 
 def run_all(classes=None, figure_classes=None):
-    """Run the pipeline over `classes` (default: every dataset class). Returns (results, aggregate).
+    """Run the pipeline over `classes` (default: every dataset class).
+
+    Returns (results, aggregate, failures): `failures` maps each skipped class name to its
+    error string, printed as a numbered list so the recovery cell can reference a class by
+    its number.
 
     Loads the backbone + CLIP once and reuses them. Overlays are saved only for classes in
     `figure_classes` (default: FIGURE_CLASSES). A class that errors out (e.g. too few val
@@ -177,12 +181,14 @@ def run_all(classes=None, figure_classes=None):
             results[name] = res
             print(f"[{i}/{len(classes)}] {name}: LGMD={res['lgmd']}")
         except Exception as e:
-            failures[name] = repr(e)
-            print(f"[{i}/{len(classes)}] {name}: SKIPPED — {type(e).__name__}: {e}")
+            failures[name] = f"{type(e).__name__}: {e}"
+            print(f"[{i}/{len(classes)}] {name}: SKIPPED — {failures[name]}")
     if failures:
         print(f"\n[run_all] completed {len(results)}/{len(classes)} classes; "
-              f"skipped {len(failures)}: {list(failures)}")
-    return results, aggregate(results)
+              f"skipped {len(failures)} — recover these in the next cell by number:")
+        for j, (fname, err) in enumerate(failures.items()):
+            print(f"  [{j}] {fname} — {err}")
+    return results, aggregate(results), failures
 
 
 def make_figures(classes=None):

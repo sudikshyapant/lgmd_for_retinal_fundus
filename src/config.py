@@ -155,6 +155,10 @@ CONFIG = {
     #   class-keyed vocab via the two-stage lexical+CLIP filter (see concept_vocab.per_class.json).
     "concept_mode": "per_class",
     "r": 25,                       # per_class only: concepts per class (paper fixes r = 25)
+    # per_class only: if fewer than r concepts survive filtering, skip the class (raise
+    # InsufficientConcepts so a multi-class run records it and continues) instead of
+    # proceeding with a short basis. Recover via concepts.add_concepts + re-evaluate.
+    "concept_skip_if_short": True,
     "concept_vocab_path": CONCEPT_VOCAB_PATH,  # stored concept table (no LLM)
     "concept_vocab_hash": _vocab_hash(),       # content hash for cache invalidation
     "concept_word_min": 1,         # lexical filter: 1-4 words — many fundus lesions are single
