@@ -151,7 +151,7 @@ CONFIG = {
     #   verbatim (no lexical/CLIP reduction). Best for cross-disease comparison.
     # "per_class": paper-faithful — each class draws its own r concepts from a
     #   class-keyed vocab via the two-stage lexical+CLIP filter (see concept_vocab.per_class.json).
-    "concept_mode": "shared",
+    "concept_mode": "per_class",
     "r": 25,                       # per_class only: concepts per class (paper fixes r = 25)
     "concept_vocab_path": CONCEPT_VOCAB_PATH,  # stored concept table (no LLM)
     "concept_vocab_hash": _vocab_hash(),       # content hash for cache invalidation
@@ -256,6 +256,46 @@ _CLASS_NAMES = None
 def _canon(name):
     """snake_case key for a class folder name, e.g. 'Diabetic Retinopathy' -> 'diabetic_retinopathy'."""
     return re.sub(r"[\s\-]+", "_", name.strip().lower())
+
+
+# Dataset folders don't always match the concept_vocab.json keys verbatim — AMD and the
+# normal class are the usual offenders (e.g. a folder named "AMD" or "Age related Macular
+# Degeneration" vs. the key "amd"; "Normal" vs. "normal_fundus"). Map any such folder name
+# to its vocab key here; both sides are compared canonically (snake_case). Extend this if
+# fundus_class_names() shows a folder whose name doesn't canonically equal its vocab key.
+CONCEPT_ALIASES = {
+    # AMD variants -> "amd"
+    "amd": "amd",
+    "armd": "amd",
+    "age_related_macular_degeneration": "amd",
+    "age_related_macular_degeneration_amd": "amd",
+    "macular_degeneration": "amd",
+    # normal / healthy variants -> "normal_fundus"
+    "normal": "normal_fundus",
+    "normal_fundus": "normal_fundus",
+    "healthy": "normal_fundus",
+    "no_disease": "normal_fundus",
+    # myopia variants -> "myopia"
+    "myopia": "myopia",
+    "pathological_myopia": "myopia",
+    "high_myopia": "myopia",
+}
+
+
+def resolve_vocab_key(class_name, available_keys):
+    """Map a dataset class/folder name to its concept_vocab.json key.
+
+    Tries an exact canonical match first, then the CONCEPT_ALIASES table. Returns the
+    matching key from `available_keys`, or None if nothing matches.
+    """
+    by_canon = {_canon(k): k for k in available_keys}
+    ck = _canon(class_name)
+    if ck in by_canon:
+        return by_canon[ck]
+    aliased = CONCEPT_ALIASES.get(ck)
+    if aliased is not None:
+        return by_canon.get(_canon(aliased))
+    return None
 
 
 def fundus_class_names(refresh=False):

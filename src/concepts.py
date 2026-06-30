@@ -21,7 +21,7 @@ import json
 import os
 import re
 
-from config import CONFIG, cache_name
+from config import CONFIG, cache_name, resolve_vocab_key
 
 
 def _canonical_key(name):
@@ -49,12 +49,12 @@ def _load_vocab(cls):
         )
     with open(path) as f:
         table = json.load(f)
-    canon = {_canonical_key(k): k for k in table}
-    key = canon.get(_canonical_key(cls))
+    key = resolve_vocab_key(cls, table.keys())   # exact canonical match, then aliases
     if key is None:
         raise KeyError(
-            f"No concept vocabulary for class '{cls}' in {path}. "
-            f"Available classes: {sorted(table)}"
+            f"No concept vocabulary for class '{cls}' in {path}. Available keys: "
+            f"{sorted(table)}. If the folder name differs from its key (e.g. AMD / "
+            f"normal variants), add it to CONCEPT_ALIASES in config.py."
         )
     raw = []
     for c in table[key]:
