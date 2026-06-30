@@ -108,8 +108,10 @@ CONFIG = {
     "class_name": "cataract",      # default showcase class (resolved by select_class; the
     "class_index": None,           # fundus analogue of the old "tabby cat" default)
     # KNOB: images per class drawn from the train split to train/fine-tune the backbone
-    # classifier. Start at ~3k/class; lower it for a quick smoke run, raise to use more.
-    "n_per_class": 3000,
+    # classifier. Capped at 2k/class so we use a subset of the 50k dataset (the full
+    # archive is still downloaded once; this bounds how much of it we actually read).
+    # Lower it for a quick smoke run, raise toward the per-class folder size to use more.
+    "n_per_class": 2000,
     "n_train": 100,                # images/class (train split) used to fit the concept basis W
     "n_val": 50,                   # images/class (val split) used for inference + metrics
     "seed": 0,

@@ -4,18 +4,25 @@ Post-hoc concept discovery for a 7-class retinal-fundus classifier. A fine-tuned
 is explained with **named clinical concepts** via CLIP-guided matrix decomposition
 (`Ā ≈ S Wᵀ`), using **BiomedCLIP** for the concept maps `S`.
 
-## Data layout
+## Data
 
-ImageFolder format (Kaggle paths shown):
+Dataset: [Retinal Fundus Image 50k](https://www.kaggle.com/datasets/gautamrajiitk/retinal-fundus-image-50k)
+(~50k images, 7 classes, ImageFolder layout):
 
 ```
-/kaggle/input/retinal-fundus-image-50k/Retinal Fundus Images/
+<data_root>/
 ├── train/<ClassName>/*.jpg
 ├── val/<ClassName>/*.jpg
 └── test/<ClassName>/*.jpg
 ```
 
-Set `CONFIG["data_root"]` to your root. Classes are read from the train folders.
+The notebook's **section 0** downloads it once via `kagglehub` (cached) and sets
+`CONFIG["data_root"]` automatically — on Kaggle the mounted `/kaggle/input` copy is used
+instead, no download. Kaggle only serves the full archive, so the ~4 GB pull is unavoidable,
+but we then **use only `CONFIG["n_per_class"]` images/class** (default **2000**) for backbone
+training, i.e. a 2k/class subset of the 50k. Kaggle credentials (`KAGGLE_USERNAME`,
+`KAGGLE_KEY`) come from `config.get_secret` — Colab Secrets, env vars, or a gitignored
+`secrets.json` (see `secrets.json.example`). Classes are read from the train folders.
 
 ## Run (notebook, after the `sys.path` cell that adds `src/`)
 
@@ -23,6 +30,7 @@ Set `CONFIG["data_root"]` to your root. Classes are read from the train folders.
 !pip -q install -r requirements.txt
 
 import config
+# Section 0 of the notebook downloads the dataset (kagglehub) and sets CONFIG["data_root"].
 config.fundus_class_names()     # confirm the 7 class-folder names
 
 import train_backbone
@@ -39,7 +47,7 @@ A class that errors is printed and skipped; completed classes are cached and res
 
 ## Key knobs (`src/config.py`)
 
-- `n_per_class` — train images/class for the backbone (default 3000).
+- `n_per_class` — train images/class for the backbone (default 2000; subset of the 50k).
 - `n_train` / `n_val` — images/class for fitting `W` / evaluating (default 100 / 50).
 - `concept_mode` — `"per_class"` (default) or `"shared"`.
 - `r` — concepts kept per class in per_class mode (default 25).
