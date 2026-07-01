@@ -98,7 +98,13 @@ def _concept_title(name, width=WRAP):
 
 
 def _save(fig, out_name, pad=0.12):
-    """Save a figure to viz_dir at the shared DPI, display it, and return the path."""
+    """Save a figure to viz_dir at the shared DPI, display it, and return the path.
+
+    The run tag prefixes the filename so a new run's figures never overwrite an old run's.
+    """
+    tag = CONFIG.get("run_tag")
+    if tag and not out_name.startswith(f"{tag}_"):
+        out_name = f"{tag}_{out_name}"
     path = os.path.join(CONFIG["viz_dir"], out_name)
     fig.savefig(path, dpi=SAVE_DPI, bbox_inches="tight", pad_inches=pad)
     plt.show()

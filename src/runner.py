@@ -65,6 +65,8 @@ def run_class(name, model, transform, clip, make_figures=False):
     # 6. inference on correctly-classified val samples (Sec 4)
     orig_logits_full = model_utils.logits_from_Z(model, Z_val)
     keep = orig_logits_full.argmax(-1) == label
+    n_diag_total = int(keep.numel())                    # val images seen by the backbone
+    n_diag_correct = int(keep.sum())                    # correctly diagnosed -> get heatmaps
     Z_val = Z_val[keep]
     val_imgs = [im for im, k in zip(val_imgs, keep.tolist()) if k]
     A_val = lgmd.unfold(Z_val)
@@ -124,9 +126,20 @@ def run_class(name, model, transform, clip, make_figures=False):
                                       "data", "model", "con", "clip", "pgd", "infer", "base", "cins")),
         _comparison)
 
+    # counts behind the heatmaps: images the backbone diagnosed correctly (every overlay is
+    # drawn on one of these), and how many of those keep the diagnosis after concept recon.
+    n_recon_correct = round(lgmd_metrics["recon_acc"] * n_diag_correct)
     result = {
         "class": cls, "index": label,
         "concepts": concept_list, "lgmd": lgmd_metrics, "comparison": comparison,
+        "diagnosed": {
+            "correct": n_diag_correct, "total": n_diag_total,
+            "acc": n_diag_correct / n_diag_total if n_diag_total else 0.0,
+        },
+        "concept_preserved": {
+            "correct": n_recon_correct, "of": n_diag_correct,
+            "acc": lgmd_metrics["recon_acc"],
+        },
     }
 
     # 8. collect per-class artifacts the multi-class figures need (LGMD coeffs + every
@@ -150,6 +163,31 @@ def aggregate(results):
             vals = [r["comparison"][m][k] for r in results.values() if m in r["comparison"]]
             agg[m][k] = sum(vals) / len(vals) if vals else None
     return agg
+
+
+def diagnosis_summary(results, print_table=True):
+    """Per-class + total counts: images diagnosed correctly, and of those how many keep the
+    diagnosis after concept reconstruction. Returns {class: {...}, "TOTAL": {...}}."""
+    rows, dt, dc, ct, cc = {}, 0, 0, 0, 0
+    for cls, r in results.items():
+        dg, cp = r.get("diagnosed"), r.get("concept_preserved")
+        if not dg:
+            continue
+        rows[cls] = {"diag_correct": dg["correct"], "diag_total": dg["total"],
+                     "diag_acc": dg["acc"], "cp_correct": cp["correct"],
+                     "cp_of": cp["of"], "cp_acc": cp["acc"]}
+        dt += dg["total"]; dc += dg["correct"]; ct += cp["of"]; cc += cp["correct"]
+    rows["TOTAL"] = {"diag_correct": dc, "diag_total": dt,
+                     "diag_acc": dc / dt if dt else 0.0, "cp_correct": cc,
+                     "cp_of": ct, "cp_acc": cc / ct if ct else 0.0}
+
+    if print_table:
+        print(f"{'Class':<16}{'Diagnosed':>16}{'Concept-preserved':>20}")
+        for cls, v in rows.items():
+            diag = f"{v['diag_correct']}/{v['diag_total']} ({v['diag_acc']:.0%})"
+            cp = f"{v['cp_correct']}/{v['cp_of']} ({v['cp_acc']:.0%})"
+            print(f"{cls:<16}{diag:>16}{cp:>20}")
+    return rows
 
 
 def metric_table(results, metric="Acc", methods=("LGMD", "FACE", "ICE", "CRAFT")):
@@ -204,7 +242,10 @@ def run_all(classes=None, figure_classes=None):
         try:
             res = run_class(name, model, transform, clip, make_figures=_canon(name) in figset)
             results[name] = res
-            print(f"[{i}/{len(classes)}] {name}: LGMD={res['lgmd']}")
+            dg, cp = res["diagnosed"], res["concept_preserved"]
+            print(f"[{i}/{len(classes)}] {name}: diagnosed {dg['correct']}/{dg['total']} "
+                  f"({dg['acc']:.0%}), concept-preserved {cp['correct']}/{cp['of']}; "
+                  f"LGMD={res['lgmd']}")
         except Exception as e:
             failures[name] = f"{type(e).__name__}: {e}"
             print(f"[{i}/{len(classes)}] {name}: SKIPPED — {failures[name]}")

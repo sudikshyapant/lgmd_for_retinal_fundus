@@ -187,6 +187,14 @@ CONFIG = {
     # --- metrics --------------------------------------------------------------
     "cins_metric": "prob",         # [suppl] C-Ins 'model performance': "prob" | "accuracy"
 
+    # --- run tag --------------------------------------------------------------
+    # Namespaces this run's outputs. It is mixed into every cache_name() hash (so all
+    # derived caches — activations, S, W, metrics — rebuild fresh) and prefixes every saved
+    # figure filename (so new figures never overwrite an old run's). Bump this string to
+    # force a clean run without hand-deleting caches. The trained backbone weights are a
+    # fixed path (not cache-keyed), so changing run_tag never triggers a retrain.
+    "run_tag": "diabetes_run2",
+
     # --- paths ----------------------------------------------------------------
     "cache_dir": CACHE_DIR,
     "results_dir": RESULTS_DIR,
@@ -220,7 +228,14 @@ def cache_name(base, ext, *groups):
     of them yields a new filename (and a fresh cache) instead of reusing a stale one.
     """
     keys = sorted({k for g in groups for k in _CACHE_DEPS[g]})
-    blob = json.dumps({k: CONFIG[k] for k in keys}, sort_keys=True, default=str)
+    payload = {k: CONFIG[k] for k in keys}
+    # A non-empty run_tag busts every cache into a fresh namespace. An empty run_tag adds
+    # nothing to the payload, so the hash exactly matches the original pre-tag caches —
+    # set CONFIG["run_tag"] = "" to switch back to the old artifacts.
+    tag = CONFIG.get("run_tag", "")
+    if tag:
+        payload["run_tag"] = tag
+    blob = json.dumps(payload, sort_keys=True, default=str)
     digest = hashlib.md5(blob.encode()).hexdigest()[:8]
     return f"{base}_{digest}{ext}"
 
