@@ -20,7 +20,7 @@ def _np(A):
 
 
 def _nmf(A, r):
-    model = NMF(n_components=r, init="nndsvda", max_iter=500, random_state=CONFIG["seed"])
+    model = NMF(n_components=r, init="nndsvda", max_iter=CONFIG["nmf_max_iter"], random_state=CONFIG["seed"])
     U = model.fit_transform(np.clip(_np(A), 0, None))   # NMF needs non-negative input
     return U, model.components_.T                        # U (N, r), W (p, r)
 
@@ -64,7 +64,7 @@ def fit_face(A, r, head_logits, shape, lam=None, iters=None, lr=None):
     n, p, h, w = shape
     A = A.to(DEVICE)
     # warm-start from a plain NMF factorization
-    nmf = NMF(n_components=r, init="nndsvda", max_iter=500, random_state=CONFIG["seed"])
+    nmf = NMF(n_components=r, init="nndsvda", max_iter=CONFIG["nmf_max_iter"], random_state=CONFIG["seed"])
     U0 = torch.tensor(nmf.fit_transform(np.clip(_np(A.cpu()), 0, None)), dtype=torch.float32)
     W0 = torch.tensor(nmf.components_.T, dtype=torch.float32)
 

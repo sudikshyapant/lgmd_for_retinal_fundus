@@ -179,6 +179,7 @@ CONFIG = {
 
     # --- baselines ------------------------------------------------------------
     "craft_levels": 2,             # [suppl] CRAFT recursive-NMF depth
+    "nmf_max_iter": 2000,          # NMF solver iterations (raised to reach convergence)
     "face_lambda": 1.0,            # [suppl] FACE KL-regularization weight
     "face_iters": 300,             # [suppl] FACE optimization iterations
     "face_lr": 1e-2,               # [suppl] FACE Adam learning rate
