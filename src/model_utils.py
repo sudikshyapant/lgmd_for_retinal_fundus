@@ -4,8 +4,9 @@ The predictor g(f(x)) is split into:
   - encoder f: image -> spatial feature map Z (n, p, h, w)
   - head    g: Z -> logits, via global average pooling + the pretrained classifier
 
-Supports the paper's backbones (ResNet34, MobileNetV2) plus ResNet50; all share the
-same encoder/head abstraction so the rest of the pipeline is backbone-agnostic.
+Supports DenseNet-121 (the active backbone for the ODIR-5K classifier) plus the paper's
+ResNet34 / MobileNetV2 and ResNet50; all share the same encoder/head abstraction so the
+rest of the pipeline is backbone-agnostic.
 """
 
 import torch
@@ -16,6 +17,7 @@ from tqdm import tqdm
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 _BACKBONES = {
+    "densenet121":  (torchvision.models.densenet121,  torchvision.models.DenseNet121_Weights.IMAGENET1K_V1),
     "resnet34":     (torchvision.models.resnet34,     torchvision.models.ResNet34_Weights.IMAGENET1K_V1),
     "resnet50":     (torchvision.models.resnet50,     torchvision.models.ResNet50_Weights.IMAGENET1K_V2),
     "mobilenet_v2": (torchvision.models.mobilenet_v2, torchvision.models.MobileNet_V2_Weights.IMAGENET1K_V2),
@@ -46,6 +48,8 @@ def _replace_head(model, name, num_classes):
     import torch.nn as nn
     if name.startswith("resnet"):
         model.fc = nn.Linear(model.fc.in_features, num_classes)
+    elif name.startswith("densenet"):
+        model.classifier = nn.Linear(model.classifier.in_features, num_classes)
     elif name == "mobilenet_v2":
         model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, num_classes)
     else:
@@ -82,7 +86,7 @@ def load_backbone(name=None):
     if not os.path.exists(wpath):
         raise FileNotFoundError(
             f"Trained backbone weights not found at {wpath}. Run train_backbone.train() "
-            f"first to fine-tune ResNet34 on the fundus dataset."
+            f"first to fine-tune the backbone on the fundus dataset."
         )
     model, transform = build_backbone(name, pretrained=False)
     model.load_state_dict(torch.load(wpath, map_location=DEVICE))
@@ -93,10 +97,19 @@ def _is_mobilenet(model):
     return isinstance(model, torchvision.models.MobileNetV2)
 
 
+def _is_densenet(model):
+    return isinstance(model, torchvision.models.DenseNet)
+
+
 def encoder(model, x):
     """f: input images -> spatial feature map Z (n, p, h, w)."""
     if _is_mobilenet(model):
         return model.features(x)                         # (n, 1280, 7, 7)
+    if _is_densenet(model):
+        # DenseNet's forward applies a final ReLU between features and pooling, so we
+        # fold it into the encoder — then head() = GAP + classifier reproduces model(x)
+        # exactly (and the feature map is the non-negative post-ReLU activation).
+        return F.relu(model.features(x), inplace=False)  # (n, 1024, 7, 7)
     # ResNet family
     x = model.conv1(x); x = model.bn1(x); x = model.relu(x); x = model.maxpool(x)
     x = model.layer1(x); x = model.layer2(x); x = model.layer3(x); x = model.layer4(x)
@@ -108,7 +121,7 @@ def classify_pooled(model, a):
 
     Grad-enabled and architecture-aware (used directly, and by FACE's KL term).
     """
-    if _is_mobilenet(model):
+    if _is_mobilenet(model) or _is_densenet(model):
         return model.classifier(a)
     return model.fc(a)
 
@@ -121,7 +134,7 @@ def head(model, z):
 
 @torch.no_grad()
 def extract_activations(model, transform, images, batch_size=16, desc="activations"):
-    """Run the encoder over images, returning Z (n, 2048, 7, 7) on CPU."""
+    """Run the encoder over images, returning Z (n, p, 7, 7) on CPU (p = feat_dim)."""
     feats = []
     for i in tqdm(range(0, len(images), batch_size), desc=desc):
         batch = torch.stack([transform(im) for im in images[i:i + batch_size]]).to(DEVICE)

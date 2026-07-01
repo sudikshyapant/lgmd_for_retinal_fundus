@@ -1,0 +1,22 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Caches / artifacts
+cache/
+*.pkl
+*.pt
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

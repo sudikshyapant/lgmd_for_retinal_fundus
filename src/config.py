@@ -97,33 +97,36 @@ _ATTRIBUTE_TERMS = [
 # change them in this one place once the supplementary is available.
 CONFIG = {
     # --- data -----------------------------------------------------------------
-    # Retinal-fundus disease dataset on disk (ImageFolder layout: <split>/<class>/*.jpg).
+    # ODIR-5K (Ocular Disease Intelligent Recognition), restricted to 5 single-label
+    # classes: Normal, Diabetes (DR), Glaucoma, Cataract, AMD. The raw ODIR-5K download
+    # is a flat image folder + a per-eye label table, so odir_prep.py first arranges it
+    # into the ImageFolder layout (<split>/<class>/*.jpg) the rest of the pipeline expects.
     # The *active* class for concept discovery is set by select_class(name); class_index
     # is its position in the sorted class list (matching torchvision ImageFolder ordering,
     # so it lines up with the trained classifier's output index).
-    "data_root": "/kaggle/input/retinal-fundus-image-50k/Retinal Fundus Images",
+    "data_root": os.path.join(CACHE_DIR, "odir5k_imagefolder"),  # built by odir_prep.prepare()
     "train_dir": "train",
     "val_dir": "val",
     "test_dir": "test",
     "class_name": "cataract",      # default showcase class (resolved by select_class; the
     "class_index": None,           # fundus analogue of the old "tabby cat" default)
-    # KNOB: images per class drawn from the train split to train/fine-tune the backbone
-    # classifier. Capped at 2k/class so we use a subset of the 50k dataset (the full
-    # archive is still downloaded once; this bounds how much of it we actually read).
-    # Lower it for a quick smoke run, raise toward the per-class folder size to use more.
+    # KNOB: max images per class drawn from the train split to train/fine-tune the backbone
+    # classifier. ODIR-5K is far smaller than the old 50k set, so most classes have well
+    # under this cap and are used in full; lower it only for a quick smoke run.
     "n_per_class": 2000,
     "n_train": 100,                # images/class (train split) used to fit the concept basis W
     "n_val": 50,                   # images/class (val split) used for inference + metrics
     "seed": 0,
 
     # --- backbone (encoder f + classifier head g) -----------------------------
-    # The classifier LGMD explains. ResNet34 fine-tuned to a num_classes-way fundus head
-    # (see train_backbone.py); weights loaded from backbone_weights. The paper also reports
-    # MobileNetV2; we don't run it here.
-    "backbone": "resnet34",        # "resnet34"
-    "num_classes": 7,              # fundus disease classes (resolved/checked against the folders)
-    "feat_dim": 512,               # p — encoder channels (resnet34 = 512)
-    "backbone_weights": os.path.join(CACHE_DIR, "resnet34_fundus.pt"),  # trained 7-way weights
+    # The classifier LGMD explains. DenseNet-121 fine-tuned to a num_classes-way fundus
+    # head (see train_backbone.py); weights loaded from backbone_weights. Reference setup
+    # reaches ~0.755 balanced accuracy on the 5-class ODIR-5K split. Other registered
+    # backbones (resnet34/50, mobilenet_v2) still work via model_utils._BACKBONES.
+    "backbone": "densenet121",     # "densenet121" | "resnet34" | "resnet50" | "mobilenet_v2"
+    "num_classes": 5,              # ODIR-5K classes N/D/G/C/A (resolved/checked against the folders)
+    "feat_dim": 1024,              # p — encoder channels (densenet121 = 1024)
+    "backbone_weights": os.path.join(CACHE_DIR, "densenet121_odir.pt"),  # trained 5-way weights
     # Backbone preprocessing: "clip_shared_224" shares CLIP's exact 224 crop so encoder
     # feature cells and CLIP red-circle cells cover identical pixels (aligns A_bar <-> S).
     # Part of the activation cache key so changing it recomputes activations.
@@ -161,8 +164,8 @@ CONFIG = {
     "concept_skip_if_short": True,
     "concept_vocab_path": CONCEPT_VOCAB_PATH,  # stored concept table (no LLM)
     "concept_vocab_hash": _vocab_hash(),       # content hash for cache invalidation
-    "concept_word_min": 1,         # lexical filter: 1-4 words — many fundus lesions are single
-    "concept_word_max": 4,         # words ("drusen", "microaneurysms"); some are 3-4 ("cotton wool spots")
+    "concept_word_min": 2,         # lexical filter: 2-3 words (suppl. A1.3) — drops bare single-word
+    "concept_word_max": 3,         # lesion names and long phrases; keeps e.g. "cotton wool spots"
     "concept_filler_terms": _FILLER_TERMS,        # generic filler removed, rule i (suppl. A1.3)
     "concept_attribute_terms": _ATTRIBUTE_TERMS,  # attribute words exempt from class-name overlap (suppl. A1.3)
     "concept_proto_images": 100,   # up to N class images for CLIP relevance ranking (suppl. A1.4)
@@ -281,10 +284,11 @@ CONCEPT_ALIASES = {
     "normal_fundus": "normal_fundus",
     "healthy": "normal_fundus",
     "no_disease": "normal_fundus",
-    # myopia variants -> "myopia"
-    "myopia": "myopia",
-    "pathological_myopia": "myopia",
-    "high_myopia": "myopia",
+    # diabetic-retinopathy variants -> "diabetic_retinopathy" (ODIR labels this "Diabetes")
+    "diabetes": "diabetic_retinopathy",
+    "diabetic": "diabetic_retinopathy",
+    "diabetic_retinopathy": "diabetic_retinopathy",
+    "dr": "diabetic_retinopathy",
 }
 
 

@@ -1,10 +1,11 @@
-"""Fine-tune the ResNet34 fundus classifier that LGMD then explains.
+"""Fine-tune the DenseNet-121 fundus classifier that LGMD then explains.
 
 LGMD explains a *trained classifier's* decisions, so before any concept discovery we
 need a backbone whose head predicts the fundus disease classes. This module fine-tunes
-ResNet34 (ImageNet-initialized) to a num_classes-way head on an `n_per_class` subset of
-the train split, validates on the val split, and saves the best weights to
-CONFIG['backbone_weights'] — exactly where model_utils.load_backbone reads them.
+the configured backbone (default DenseNet-121, ImageNet-initialized) to a num_classes-way
+head on an `n_per_class` subset of the train split, validates on the val split, and saves
+the best weights to CONFIG['backbone_weights'] — exactly where model_utils.load_backbone
+reads them.
 
 Usage (from the notebook, after the sys.path setup cell):
     import train_backbone
@@ -19,7 +20,6 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets
-from torchvision.models import ResNet34_Weights
 from torchvision.transforms import (Compose, Normalize, RandomHorizontalFlip,
                                      RandomResizedCrop, ToTensor)
 from tqdm import tqdm
@@ -32,8 +32,9 @@ DEVICE = model_utils.DEVICE
 
 
 def _mean_std():
-    """ImageNet mean/std the backbone was pretrained with (also used at LGMD time)."""
-    base = ResNet34_Weights.IMAGENET1K_V1.transforms()
+    """ImageNet mean/std the active backbone was pretrained with (also used at LGMD time)."""
+    _, weights = model_utils._BACKBONES[CONFIG["backbone"]]
+    base = weights.transforms()
     return base.mean, base.std
 
 
@@ -76,7 +77,7 @@ def _evaluate(model, loader):
 
 
 def train(n_per_class=None, epochs=None, lr=None, batch_size=None, seed=None):
-    """Fine-tune ResNet34 on the fundus subset and save the best-val-acc weights.
+    """Fine-tune the backbone on the fundus subset and save the best-val-acc weights.
 
     All args default to the corresponding CONFIG knobs. Returns the path to the saved
     weights (CONFIG['backbone_weights']).
@@ -108,7 +109,7 @@ def train(n_per_class=None, epochs=None, lr=None, batch_size=None, seed=None):
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
                             num_workers=2, pin_memory=True)
 
-    # Model: ImageNet-pretrained ResNet34 with a fresh num_classes-way head.
+    # Model: ImageNet-pretrained backbone with a fresh num_classes-way head.
     model, _ = model_utils.build_backbone(pretrained=True)
     opt = torch.optim.Adam(model.parameters(), lr=lr,
                            weight_decay=CONFIG["train_weight_decay"])

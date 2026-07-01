@@ -14,7 +14,8 @@ Filtering mirrors the supplementary material:
   Stage 2 — CLIP semantic (suppl. A1.4): rank surviving concepts by cosine
     similarity to the mean CLIP embedding of class images (when images are
     available), then greedily keep diverse concepts, enforcing pairwise CLIP-text
-    cosine similarity below CONFIG["dedup_threshold"]. Result: exactly r concepts.
+    cosine similarity below CONFIG["dedup_threshold"]. Result: at most r concepts
+    (fewer if dedup collapses the pool — get_concepts then flags the short class).
 """
 
 import hashlib
@@ -126,23 +127,17 @@ def _clip_select(concepts, clip, images, threshold, r):
         scores = text_emb @ proto                       # s_i = <t_i, mu_I>
         order.sort(key=lambda i: float(scores[i]), reverse=True)
 
-    kept, kept_emb, deferred = [], [], []
+    # Greedy diverse selection, no backfill: near-duplicates are dropped outright. If the
+    # diversity dedup leaves fewer than r, we return short on purpose so get_concepts raises
+    # InsufficientConcepts — run_all then skips the class and the recovery cell (add_concepts)
+    # supplies more distinct candidates for it.
+    kept, kept_emb = [], []
     for i in order:
         emb = text_emb[i]
         if any(float(emb @ e) > threshold for e in kept_emb):   # near-duplicate in CLIP-text space
-            deferred.append(i)                          # keep as a relevance-ordered backup
             continue
         kept.append(concepts[i])
         kept_emb.append(emb)
-        if len(kept) == r:
-            return kept
-
-    # Diversity alone left us short of r (common when a class's concepts are all near-
-    # synonyms, e.g. cataract's many "haze / blur / opacity" phrasings collapse under the
-    # 0.80 dedup threshold). Rather than hard-fail, top up with the next-most-relevant
-    # deferred concepts so we still return r whenever the lexical pool is large enough.
-    for i in deferred:
-        kept.append(concepts[i])
         if len(kept) == r:
             break
     return kept
@@ -223,7 +218,7 @@ def get_concepts(clip, images=None):
 def add_concepts(cls, new_concepts, vocab_path=None):
     """Append candidate concepts for `cls` to the vocab table and refresh the cache key.
 
-    Recovery path for a class skipped with InsufficientConcepts: supply extra 2-4 word
+    Recovery path for a class skipped with InsufficientConcepts: supply extra 2-3 word
     clinical phrases (distinct enough to survive the CLIP dedup at CONFIG["dedup_threshold"]),
     then re-run just that class with runner.run_all(['<cls>']).
 
