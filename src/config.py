@@ -169,13 +169,13 @@ CONFIG = {
     "concept_filler_terms": _FILLER_TERMS,        # generic filler removed, rule i (suppl. A1.3)
     "concept_attribute_terms": _ATTRIBUTE_TERMS,  # attribute words exempt from class-name overlap (suppl. A1.3)
     "concept_proto_images": 100,   # up to N class images for CLIP relevance ranking (suppl. A1.4)
-    "dedup_threshold": 0.80,       # CLIP-text cosine sim above which concepts are near-dups (suppl. A1.4)
+    "dedup_threshold": 0.93,       # CLIP-text cosine sim above which concepts are near-dups (suppl. A1.4)
 
     # --- optimization ---------------------------------------------------------
     # NOTE: PGD step sizes are NOT free params — the paper fixes them via the spectral
     # norm (Lipschitz constant), so they are computed, not configured here.
     "pgd_iters": 500,              # [suppl] PGD iterations to fit the basis W
-    "infer_iters": 50,             # [suppl] PGD refinement iterations at inference
+    "infer_iters": 50,              # [suppl] PGD refinement iterations at inference
 
     # --- baselines ------------------------------------------------------------
     "craft_levels": 2,             # [suppl] CRAFT recursive-NMF depth
