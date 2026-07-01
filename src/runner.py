@@ -152,6 +152,31 @@ def aggregate(results):
     return agg
 
 
+def metric_table(results, metric="Acc", methods=("LGMD", "FACE", "ICE", "CRAFT")):
+    """Per-class metric table for one metric, shaped for viz.render_metric_table.
+
+    Returns {backbone: {class: {method: value}, ..., "Average": {method: mean}}}. Rows are
+    the classes that produced a `comparison` block (plus an Average row); columns are the
+    baseline methods vs. LGMD. Feed one call per metric ("Acc", "C-Ins") to get a table
+    that reports every retinal-disease class instead of only the aggregate mean.
+    """
+    bb = CONFIG["backbone"]
+    per_class = {}
+    for cls, r in results.items():
+        comp = r.get("comparison", {})
+        row = {m: comp[m][metric] for m in methods if m in comp and metric in comp[m]}
+        if row:
+            per_class[cls] = row
+    if per_class:                                       # Average row across the classes
+        avg = {}
+        for m in methods:
+            vals = [row[m] for row in per_class.values() if m in row]
+            if vals:
+                avg[m] = sum(vals) / len(vals)
+        per_class["Average"] = avg
+    return {bb: per_class}
+
+
 def run_all(classes=None, figure_classes=None):
     """Run the pipeline over `classes` (default: every dataset class).
 

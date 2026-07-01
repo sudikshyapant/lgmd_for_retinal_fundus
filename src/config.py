@@ -108,7 +108,7 @@ CONFIG = {
     "train_dir": "train",
     "val_dir": "val",
     "test_dir": "test",
-    "class_name": "cataract",      # default showcase class (resolved by select_class; the
+    "class_name": "Diabetes",      # default showcase class (resolved by select_class; the
     "class_index": None,           # fundus analogue of the old "tabby cat" default)
     # KNOB: max images per class drawn from the train split to train/fine-tune the backbone
     # classifier. ODIR-5K is far smaller than the old 50k set, so most classes have well
@@ -333,7 +333,7 @@ def fundus_class_names(refresh=False):
 # Qualitative concept overlays are saved only for these classes (the figure subset) —
 # the fundus analogue of the paper's showcase rows. Matched canonically against the
 # actual folder names, so case/spacing need not be exact ("cataract" ~ "Cataract").
-FIGURE_CLASSES = ["cataract"]
+FIGURE_CLASSES = ["Diabetes"]
 
 
 def select_class(name):

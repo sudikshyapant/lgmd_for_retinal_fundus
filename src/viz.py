@@ -1,12 +1,19 @@
-"""Concept heatmap visualization (paper Sec 3.6 / Eq. 6).
+"""Publication-quality visualization for LGMD concept discovery (paper Sec 3.6 / Eq. 6).
 
 Project the inferred semantic coefficients S_hat back into the spatial domain, normalize
 each concept map to [0, 1], upsample, and overlay it on the input image. Because each
 column of S_hat corresponds to a named concept, every heatmap is human-interpretable.
+
+All figures and tables share one design system (`_init_style()` + the constants below):
+a single sans-serif family, a fixed type scale, one heatmap colormap, one accent colour
+for discovered concepts, 300-DPI output on a white canvas, and consistent table styling.
+Keeping every figure on the same system is what makes the panels read as one coherent set.
 """
 
 import math
 import os
+import re
+import textwrap
 
 import numpy as np
 import torch
@@ -17,6 +24,87 @@ from tqdm import tqdm
 from config import CONFIG
 from data_utils import clip_preprocess
 
+# --- design system ---------------------------------------------------------
+SAVE_DPI = 300                     # publication raster resolution
+HEAT_CMAP = "viridis"              # one perceptually-uniform colormap everywhere
+HEAT_ALPHA = 0.55                  # overlay opacity for every heatmap
+CONCEPT_COLOR = "#1f4e79"          # deep blue: discovered / named LGMD concepts
+CONTOUR_COLOR = "#d62728"          # red: ICE active-region outline
+ICE_CONTOUR_LEVEL = 0.72           # activation threshold for the ICE outline; higher ->
+                                   # tighter, smaller circle (tuned for small fundus lesions)
+HEADER_BG = "#e8edf4"             # table header fill
+STRIPE_BG = "#f6f8fb"             # table zebra-stripe fill
+EDGE_COLOR = "#d7dee8"            # table grid lines
+
+# type scale (points)
+FS_SUPTITLE = 14
+FS_TITLE = 11
+FS_LABEL = 10
+FS_CONCEPT = 8
+FS_TICK = 8
+
+WRAP = 16                          # default character width for wrapped labels
+
+
+def _init_style():
+    """Apply the shared rcParams once so every figure/table is visually consistent."""
+    plt.rcParams.update({
+        "figure.facecolor": "white",
+        "savefig.facecolor": "white",
+        "savefig.bbox": "tight",
+        "savefig.dpi": SAVE_DPI,
+        "font.family": "sans-serif",
+        "font.sans-serif": ["DejaVu Sans", "Arial", "Helvetica"],
+        "font.size": FS_LABEL,
+        "axes.titlesize": FS_TITLE,
+        "axes.titleweight": "medium",
+        "axes.linewidth": 0.8,
+        "figure.titlesize": FS_SUPTITLE,
+        "figure.titleweight": "semibold",
+        "image.interpolation": "nearest",
+    })
+
+
+_init_style()
+
+
+# --- shared helpers --------------------------------------------------------
+_PRETTY_CLASS = {
+    "diabetes": "Diabetic Retinopathy",
+    "diabetic_retinopathy": "Diabetic Retinopathy",
+    "amd": "AMD",
+    "normal": "Normal",
+    "normal_fundus": "Normal",
+    "cataract": "Cataract",
+    "glaucoma": "Glaucoma",
+}
+
+
+def _pretty_class(name):
+    """Dataset folder name -> clean clinical display label (e.g. 'Diabetes' -> 'Diabetic Retinopathy')."""
+    key = re.sub(r"[\s\-]+", "_", str(name).strip().lower())
+    return _PRETTY_CLASS.get(key, str(name).replace("_", " ").title())
+
+
+def _wrap(text, width=WRAP):
+    """Soft-wrap a label onto stacked lines so long phrases never clip the axes/block edge."""
+    text = str(text)
+    return "\n".join(textwrap.wrap(text, width=width)) or text
+
+
+def _concept_title(name, width=WRAP):
+    """Quoted, wrapped concept label used as an axes title."""
+    return _wrap(f'“{name}”', width=width)
+
+
+def _save(fig, out_name, pad=0.12):
+    """Save a figure to viz_dir at the shared DPI, display it, and return the path."""
+    path = os.path.join(CONFIG["viz_dir"], out_name)
+    fig.savefig(path, dpi=SAVE_DPI, bbox_inches="tight", pad_inches=pad)
+    plt.show()
+    print(f"[viz] saved {path}")
+    return path
+
 
 def _heatmap(coeffs_k, grid, size=224):
     """One concept's coefficients (h*w,) -> normalized [0,1] heatmap upsampled to `size`."""
@@ -26,31 +114,64 @@ def _heatmap(coeffs_k, grid, size=224):
     return m[0, 0].numpy()
 
 
+def _side_label(ax, text, color="black", size=FS_LABEL, wrap=None):
+    """Rotated row/block label pinned at an axis's left margin (survives axis('off'))."""
+    label = _wrap(text, wrap) if wrap else text
+    ax.annotate(label, xy=(0, 0.5), xytext=(-10, 0), xycoords="axes fraction",
+                textcoords="offset points", ha="right", va="center", rotation=90,
+                fontsize=size, color=color)
+
+
+def _add_heat_colorbar(fig, axes, label="normalized concept activation"):
+    """Attach a single shared colorbar describing the [0,1] heatmap scale."""
+    sm = plt.cm.ScalarMappable(cmap=HEAT_CMAP, norm=plt.Normalize(0, 1))
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=axes, fraction=0.026, pad=0.02)
+    cbar.set_label(label, fontsize=FS_TICK)
+    cbar.ax.tick_params(labelsize=max(FS_TICK - 1, 6))
+    cbar.outline.set_linewidth(0.5)
+    return cbar
+
+
+def _style_table(tbl, n_header):
+    """Give a matplotlib table a clean, consistent look: shaded bold header, zebra rows."""
+    for (r, c), cell in tbl.get_celld().items():
+        cell.set_edgecolor(EDGE_COLOR)
+        cell.set_linewidth(0.6)
+        if r == 0:                                   # header row
+            cell.set_facecolor(HEADER_BG)
+            cell.set_text_props(fontweight="bold")
+        elif r % 2 == 0:                             # zebra striping for readability
+            cell.set_facecolor(STRIPE_BG)
+        if c == 0 and r > 0:                         # row label column
+            cell.set_text_props(fontweight="semibold")
+    tbl.auto_set_column_width(range(n_header))
+
+
 def save_concept_overlays(images, S_hat, concepts, out_name="overlays.png", max_images=4):
     """Save a grid of per-concept heatmaps overlaid on the first few validation images."""
     grid, r = CONFIG["grid"], len(concepts)
     n_show = min(max_images, len(images))
     S_hat = S_hat.reshape(len(images), grid * grid, r)
 
-    fig, axes = plt.subplots(n_show, r + 1, figsize=(2 * (r + 1), 2 * n_show))
+    fig, axes = plt.subplots(n_show, r + 1, figsize=(1.9 * (r + 1), 1.9 * n_show),
+                             gridspec_kw={"wspace": 0.05, "hspace": 0.12})
     axes = np.atleast_2d(axes)
     for i in tqdm(range(n_show), desc="rendering overlays"):
         img = clip_preprocess(images[i])
         axes[i, 0].imshow(img)
-        axes[i, 0].set_title("input", fontsize=6)
+        if i == 0:
+            axes[i, 0].set_title("input", fontsize=FS_CONCEPT)
         axes[i, 0].axis("off")
         for k in range(r):
             axes[i, k + 1].imshow(img)
-            axes[i, k + 1].imshow(_heatmap(S_hat[i, :, k], grid), cmap="jet", alpha=0.5)
-            axes[i, k + 1].set_title(concepts[k], fontsize=5)
+            axes[i, k + 1].imshow(_heatmap(S_hat[i, :, k], grid), cmap=HEAT_CMAP,
+                                  alpha=HEAT_ALPHA, vmin=0, vmax=1)
+            if i == 0:
+                axes[i, k + 1].set_title(_concept_title(concepts[k], width=12),
+                                         fontsize=6)
             axes[i, k + 1].axis("off")
-
-    path = os.path.join(CONFIG["viz_dir"], out_name)
-    plt.tight_layout()
-    plt.savefig(path, dpi=120, bbox_inches="tight")
-    plt.show()
-    print(f"[viz] saved {path}")
-    return path
+    return _save(fig, out_name)
 
 
 def _per_image_concept_scores(S):
@@ -79,30 +200,33 @@ def plot_score_distributions(S_before, S_after, out_name="fig4_score_distributio
     r = b.shape[1]
     pos = list(range(r))
 
-    fig, ax = plt.subplots(1, 2, figsize=(13, 4))
-    for axis, data, title in (
-        (ax[0], b, "Before Optimization (CLIP extracted)"),
-        (ax[1], a, "After Optimization (Learned)"),
+    fig, ax = plt.subplots(1, 2, figsize=(13, 4), sharey=True)
+    for axis, data, title, color in (
+        (ax[0], b, "Before optimization (CLIP-extracted)", "#9aa7b5"),
+        (ax[1], a, "After optimization (learned)", CONCEPT_COLOR),
     ):
-        axis.boxplot([data[:, k] for k in range(r)], positions=pos,
-                     widths=0.6, showfliers=False)
+        bp = axis.boxplot([data[:, k] for k in range(r)], positions=pos, widths=0.6,
+                          showfliers=False, patch_artist=True,
+                          medianprops=dict(color="white", linewidth=1.2))
+        for box in bp["boxes"]:
+            box.set(facecolor=color, edgecolor=color, alpha=0.85)
+        for art in bp["whiskers"] + bp["caps"]:
+            art.set(color=color, linewidth=0.9)
         axis.set_title(title)
-        axis.set_xlabel("Concept index")
-        axis.set_ylabel("Concept score (mean)")
+        axis.set_xlabel("concept index")
         axis.set_xticks(pos)
-        axis.set_xticklabels(pos, fontsize=7)
-        axis.grid(axis="y", alpha=0.3)
-
-    path = os.path.join(CONFIG["viz_dir"], out_name)
-    plt.tight_layout()
-    plt.savefig(path, dpi=120, bbox_inches="tight")
-    plt.show()
-    print(f"[viz] saved {path}")
-    return path
+        axis.set_xticklabels(pos, fontsize=max(FS_TICK - 1, 6))
+        axis.grid(axis="y", alpha=0.3, linewidth=0.6)
+        for spine in ("top", "right"):
+            axis.spines[spine].set_visible(False)
+    ax[0].set_ylabel("concept score")
+    fig.tight_layout()
+    return _save(fig, out_name)
 
 
 def plot_concept_heatmaps(images, S_hat, concepts, img_index=0, which=None, top_k=3,
-                          out_name="fig1_concept_heatmaps.png", alpha=0.6, cmap="viridis"):
+                          out_name="fig1_concept_heatmaps.png", alpha=HEAT_ALPHA,
+                          cmap=HEAT_CMAP):
     """Fig 1: one input image + its top named-concept heatmaps in a single clean row.
 
     `which` selects concepts by name (e.g. ["pointy ears", "green eyes", "whiskers"]);
@@ -118,27 +242,24 @@ def plot_concept_heatmaps(images, S_hat, concepts, img_index=0, which=None, top_
         sel = [concepts.index(c) for c in which]
 
     img = clip_preprocess(images[img_index])
-    fig, axes = plt.subplots(1, len(sel) + 1, figsize=(3 * (len(sel) + 1), 3))
+    fig, axes = plt.subplots(1, len(sel) + 1, figsize=(2.7 * (len(sel) + 1), 3.0),
+                             gridspec_kw={"wspace": 0.06})
     axes = np.atleast_1d(axes)
     axes[0].imshow(img)
-    axes[0].set_title("Input Image")
+    axes[0].set_title("input image")
     axes[0].axis("off")
     for ax, k in zip(axes[1:], sel):
         ax.imshow(img)
-        ax.imshow(_heatmap(S[img_index, :, k], grid), cmap=cmap, alpha=alpha)
-        ax.set_title(f'"{concepts[k]}"')
+        ax.imshow(_heatmap(S[img_index, :, k], grid), cmap=cmap, alpha=alpha, vmin=0, vmax=1)
+        ax.set_title(_concept_title(concepts[k]), fontsize=FS_CONCEPT, color=CONCEPT_COLOR)
         ax.axis("off")
-
-    path = os.path.join(CONFIG["viz_dir"], out_name)
-    plt.tight_layout()
-    plt.savefig(path, dpi=120, bbox_inches="tight")
-    plt.show()
-    print(f"[viz] saved {path}")
-    return path
+    _add_heat_colorbar(fig, list(axes))
+    return _save(fig, out_name)
 
 
 def plot_baseline_comparison(images, method_maps, out_name="fig3_baseline_comparison.png",
-                             concepts_by_method=None, n_images=3, alpha=0.6, cmap="viridis"):
+                             concepts_by_method=None, n_images=3, alpha=HEAT_ALPHA,
+                             cmap=HEAT_CMAP):
     """Fig 3: top-concept overlays per method across a few sample images.
 
     `method_maps` maps a method name (e.g. "ICE", "CRAFT", "FACE", "LGMD") to its
@@ -154,14 +275,14 @@ def plot_baseline_comparison(images, method_maps, out_name="fig3_baseline_compar
     rows = ["Data Samples"] + list(method_maps.keys())
     concepts_by_method = concepts_by_method or {}
 
-    fig, axes = plt.subplots(len(rows), n_show, figsize=(3 * n_show, 3 * len(rows)))
+    fig, axes = plt.subplots(len(rows), n_show, figsize=(2.7 * n_show, 2.7 * len(rows)),
+                             gridspec_kw={"wspace": 0.05, "hspace": 0.14})
     axes = np.atleast_2d(axes)
     imgs = [clip_preprocess(images[i]) for i in range(n_show)]
 
     for j in range(n_show):
         axes[0, j].imshow(imgs[j])
         axes[0, j].axis("off")
-    axes[0, 0].set_ylabel("Data Samples", fontsize=10, rotation=90)
 
     for row, name in enumerate(method_maps, start=1):
         S = method_maps[name]
@@ -171,24 +292,17 @@ def plot_baseline_comparison(images, method_maps, out_name="fig3_baseline_compar
         for j in range(n_show):
             top = int(torch.as_tensor(Smap[j]).sum(0).argmax())
             axes[row, j].imshow(imgs[j])
-            axes[row, j].imshow(_heatmap(Smap[j, :, top], grid), cmap=cmap, alpha=alpha)
+            axes[row, j].imshow(_heatmap(Smap[j, :, top], grid), cmap=cmap, alpha=alpha,
+                                vmin=0, vmax=1)
             axes[row, j].axis("off")
-            label = f'"{names[top]}"' if names else f"comp #{top}"
-            axes[row, j].set_title(label, fontsize=8)
-        axes[row, 0].set_ylabel(name, fontsize=10)
+            label = _concept_title(names[top]) if names else f"comp #{top}"
+            axes[row, j].set_title(label, fontsize=FS_CONCEPT,
+                                   color=CONCEPT_COLOR if names else "black")
 
     # row labels (axis("off") hides ylabel, so annotate at the left margin instead)
     for row, name in enumerate(rows):
-        axes[row, 0].annotate(name, xy=(0, 0.5), xytext=(-10, 0),
-                              xycoords="axes fraction", textcoords="offset points",
-                              ha="right", va="center", rotation=90, fontsize=11)
-
-    path = os.path.join(CONFIG["viz_dir"], out_name)
-    plt.tight_layout()
-    plt.savefig(path, dpi=120, bbox_inches="tight")
-    plt.show()
-    print(f"[viz] saved {path}")
-    return path
+        _side_label(axes[row, 0], name, size=FS_LABEL)
+    return _save(fig, out_name)
 
 
 def _crop_patch(img224, cell_idx, grid, patch_cells):
@@ -232,11 +346,12 @@ def plot_concept_patches(images, S, concepts=None, top_concepts=3, n_patches=3,
     imgs224 = [clip_preprocess(im) for im in images]
     n_show = min(n_patches, len(images))
 
-    fig, axes = plt.subplots(len(chosen), n_show,
-                             figsize=(2.2 * n_show, 2.2 * len(chosen)))
+    fig, axes = plt.subplots(len(chosen), n_show, figsize=(2.1 * n_show, 2.1 * len(chosen)),
+                             gridspec_kw={"wspace": 0.05, "hspace": 0.08})
     axes = np.atleast_2d(axes)
+    fig.subplots_adjust(left=0.22)                     # room for rotated concept labels
     if title:
-        fig.suptitle(title, fontsize=12)
+        fig.suptitle(title)
 
     for row, k in enumerate(chosen):
         per_img = Sr[:, :, k]                                   # (n, hw)
@@ -248,22 +363,14 @@ def plot_concept_patches(images, S, concepts=None, top_concepts=3, n_patches=3,
             if style == "contour":                             # ICE: red region outline
                 ax.imshow(imgs224[im_idx])
                 ax.contour(_heatmap(Sr[im_idx, :, k], grid),
-                           levels=[0.6], colors="red", linewidths=1.5)
+                           levels=[ICE_CONTOUR_LEVEL], colors=CONTOUR_COLOR, linewidths=1.5)
             else:                                              # crop exemplar patch
                 ax.imshow(_crop_patch(imgs224[im_idx], cell, grid, patch_cells))
             ax.axis("off")
-        label = concepts[k] if concepts else f"comp #{k}"
-        axes[row, 0].annotate(label, xy=(0, 0.5), xytext=(-12, 0),
-                              xycoords="axes fraction", textcoords="offset points",
-                              ha="right", va="center", rotation=90, fontsize=10,
-                              color="tab:blue" if concepts else "black")
-
-    path = os.path.join(CONFIG["viz_dir"], out_name)
-    plt.tight_layout()
-    plt.savefig(path, dpi=120, bbox_inches="tight")
-    plt.show()
-    print(f"[viz] saved {path}")
-    return path
+        raw = concepts[k] if concepts else f"comp #{k}"
+        _side_label(axes[row, 0], raw, color=CONCEPT_COLOR if concepts else "black",
+                    size=FS_CONCEPT, wrap=WRAP)
+    return _save(fig, out_name)
 
 
 def render_metric_table(table, out_name, methods=("OURS", "FACE", "ICE", "CRAFT"),
@@ -301,7 +408,7 @@ def render_metric_table(table, out_name, methods=("OURS", "FACE", "ICE", "CRAFT"
     col_labels = [f"{bb}:{m}" for bb in backbones for m in methods]
     cell_text = []
     for cat in cats:
-        row = [cat]
+        row = [_pretty_class(cat) if cat != "Average" else cat]
         for bb in backbones:
             row += fmt_row(cat, bb)
         cell_text.append(row)
@@ -326,21 +433,84 @@ def render_metric_table(table, out_name, methods=("OURS", "FACE", "ICE", "CRAFT"
         print("  ".join(c.ljust(widths[i]) for i, c in enumerate(r)))
     print("(* best, ^ second-best)")
 
-    fig, ax = plt.subplots(figsize=(1.4 * (len(col_labels) + 1), 0.5 * (len(cats) + 1)))
+    fig, ax = plt.subplots(figsize=(1.5 * (len(col_labels) + 1), 0.55 * (len(cats) + 1)))
     ax.axis("off")
     if title:
-        ax.set_title(title, fontsize=10, loc="left", pad=12)
-    tbl = ax.table(cellText=cell_text, colLabels=["Category"] + col_labels,
-                   cellLoc="center", loc="center")
+        ax.set_title(title, fontsize=FS_TITLE, loc="left", pad=12)
+    tbl = ax.table(cellText=cell_text, colLabels=header, cellLoc="center", loc="center")
     tbl.auto_set_font_size(False)
-    tbl.set_fontsize(8)
-    tbl.scale(1, 1.4)
+    tbl.set_fontsize(FS_CONCEPT)
+    tbl.scale(1, 1.5)
+    _style_table(tbl, len(header))
+    return _save(fig, out_name)
 
-    path = os.path.join(CONFIG["viz_dir"], out_name)
-    plt.savefig(path, dpi=150, bbox_inches="tight")
-    plt.show()
-    print(f"[viz] saved {path}")
-    return path
+
+def render_class_metric_table(class_name, comparison,
+                              metrics=("Acc", "C-Ins", "agreement", "kl", "recon_err"),
+                              methods=("LGMD", "FACE", "ICE", "CRAFT"),
+                              higher_is_better=None, value_fmt="{:.3f}", out_name=None):
+    """One class's methods x metrics table (best per metric bold, second-best underlined).
+
+    `comparison` is results[class]["comparison"] = {method: {metric: value}}. Rows are the
+    methods, columns are every metric used. Within each metric column the best method is
+    bolded and the second-best underlined, using `higher_is_better[metric]` for the
+    direction — Acc / C-Ins / agreement are up, kl / recon_err are down. An arrow after
+    each header marks its direction. Renders + saves a styled table (and prints a
+    plain-text version), mirroring render_metric_table.
+    """
+    higher = {"Acc": True, "C-Ins": True, "agreement": True, "kl": False, "recon_err": False}
+    if higher_is_better:
+        higher.update(higher_is_better)
+    # keep only metrics that at least one method actually reports for this class
+    metrics = [m for m in metrics if any(m in comparison.get(meth, {}) for meth in methods)]
+
+    def rank(metric):
+        """Per-column rank of each method: 0 = best, 1 = second-best (dir from `higher`)."""
+        vals = [comparison.get(meth, {}).get(metric, float("nan")) for meth in methods]
+        order = np.argsort(vals)
+        if higher.get(metric, True):
+            order = order[::-1]
+        return {int(idx): pos for pos, idx in enumerate(order)}
+
+    ranks = {metric: rank(metric) for metric in metrics}
+    cell_text, text_rows = [], []
+    for i, meth in enumerate(methods):
+        row, trow = [meth], [meth]
+        for metric in metrics:
+            v = comparison.get(meth, {}).get(metric, float("nan"))
+            s = value_fmt.format(v)
+            r = ranks[metric].get(i)
+            mark = "*" if r == 0 else "^" if r == 1 else " "
+            trow.append(s + mark)
+            if r == 0:
+                s = r"$\mathbf{" + s + "}$"           # best -> bold
+            elif r == 1:
+                s = r"$\underline{" + s + "}$"        # second -> underlined
+            row.append(s)
+        cell_text.append(row)
+        text_rows.append(trow)
+
+    disp_class = _pretty_class(class_name)
+    arrow = {m: "↑" if higher.get(m, True) else "↓" for m in metrics}
+    header = ["Method"] + [f"{m} {arrow[m]}" for m in metrics]
+    text_header = ["Method"] + list(metrics)
+    widths = [max(len(r[i]) for r in [text_header] + text_rows) for i in range(len(text_header))]
+    print(f"{disp_class} — per-metric performance (dir: " +
+          ", ".join(f"{m}{arrow[m]}" for m in metrics) + ")")
+    print("  ".join(h.ljust(widths[i]) for i, h in enumerate(text_header)))
+    for r in text_rows:
+        print("  ".join(c.ljust(widths[i]) for i, c in enumerate(r)))
+    print("(* best, ^ second-best)")
+
+    fig, ax = plt.subplots(figsize=(1.6 * (len(metrics) + 1), 0.55 * (len(methods) + 1)))
+    ax.axis("off")
+    ax.set_title(f"{disp_class} — per-metric performance", fontsize=FS_TITLE, loc="left", pad=12)
+    tbl = ax.table(cellText=cell_text, colLabels=header, cellLoc="center", loc="center")
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(FS_CONCEPT)
+    tbl.scale(1, 1.5)
+    _style_table(tbl, len(header))
+    return _save(fig, out_name or f"table_{class_name.lower()}_metrics.png")
 
 
 # ---------------------------------------------------------------------------
@@ -348,7 +518,8 @@ def render_metric_table(table, out_name, methods=("OURS", "FACE", "ICE", "CRAFT"
 # ---------------------------------------------------------------------------
 # Each takes `per_class`: {class_name: {"images": [PIL], "concepts": [str],
 # "S_hat": LGMD coeffs (n*h*w, r), "method_maps": {"ICE"/"CRAFT"/"FACE"/"LGMD": (n*h*w, K)}}}.
-# runner.make_figures() builds this dict for the paper's reference classes.
+# Classes are laid out top-to-bottom in the given order, so the caller controls ordering.
+# runner.make_figures() builds this dict for the showcase classes.
 
 def _representative_index(S):
     """Index of the image carrying the most total concept-activation mass."""
@@ -357,19 +528,22 @@ def _representative_index(S):
 
 def plot_concept_heatmaps_grid(per_class, classes=None, top_k=3, which_by_class=None,
                                out_name="fig1_concept_heatmaps_grid.png",
-                               alpha=0.6, cmap="viridis"):
+                               alpha=HEAT_ALPHA, cmap=HEAT_CMAP):
     """Fig 1 (multi-class): one row per class = [input image | top-k named concept heatmaps].
 
     For each class, a representative image is chosen and its strongest LGMD concepts are
     overlaid as heatmaps (or pass `which_by_class={cls: [names]}` to fix the concepts).
+    Rows follow the order of `classes` (default: per_class insertion order).
     """
     classes = classes or list(per_class)
     grid = CONFIG["grid"]
     which_by_class = which_by_class or {}
 
     fig, axes = plt.subplots(len(classes), top_k + 1,
-                             figsize=(3 * (top_k + 1), 3 * len(classes)))
+                             figsize=(2.7 * (top_k + 1), 2.7 * len(classes)),
+                             gridspec_kw={"wspace": 0.05, "hspace": 0.14})
     axes = np.atleast_2d(axes)
+    fig.subplots_adjust(left=0.16)                     # room for rotated class labels
     for row, name in enumerate(classes):
         d = per_class[name]
         imgs, concepts = d["images"], d["concepts"]
@@ -386,24 +560,20 @@ def plot_concept_heatmaps_grid(per_class, classes=None, top_k=3, which_by_class=
         axes[row, 0].imshow(img)
         axes[row, 0].axis("off")
         if row == 0:
-            axes[row, 0].set_title("Input Image")
-        axes[row, 0].annotate(name, xy=(0, 0.5), xytext=(-12, 0), xycoords="axes fraction",
-                              textcoords="offset points", ha="right", va="center",
-                              rotation=90, fontsize=11)
+            axes[row, 0].set_title("input image")
+        _side_label(axes[row, 0], _pretty_class(name), size=FS_LABEL, wrap=12)
         for col, k in enumerate(sel, start=1):
             axes[row, col].imshow(img)
-            axes[row, col].imshow(_heatmap(S[idx, :, k], grid), cmap=cmap, alpha=alpha)
-            axes[row, col].set_title(f'"{concepts[k]}"', fontsize=9)
+            axes[row, col].imshow(_heatmap(S[idx, :, k], grid), cmap=cmap, alpha=alpha,
+                                  vmin=0, vmax=1)
+            axes[row, col].set_title(_concept_title(concepts[k]), fontsize=FS_CONCEPT,
+                                     color=CONCEPT_COLOR)
             axes[row, col].axis("off")
         for col in range(len(sel) + 1, top_k + 1):           # hide unused cells
             axes[row, col].axis("off")
 
-    path = os.path.join(CONFIG["viz_dir"], out_name)
-    plt.tight_layout()
-    plt.savefig(path, dpi=130, bbox_inches="tight")
-    plt.show()
-    print(f"[viz] saved {path}")
-    return path
+    _add_heat_colorbar(fig, axes)
+    return _save(fig, out_name)
 
 
 def plot_baseline_grid(per_class, classes=None, methods=("ICE", "CRAFT", "FACE"),
@@ -413,7 +583,7 @@ def plot_baseline_grid(per_class, classes=None, methods=("ICE", "CRAFT", "FACE")
     Each group shows `n_images` per class. ICE traces a red contour around its active region
     (it localizes on the feature map); CRAFT/FACE show cropped exemplar patches at the peak
     cell of their dominant component (they pool spatially). This is the paper's "baselines
-    give coarse, unnamed regions" panel.
+    give coarse, unnamed regions" panel. Rows follow the order of `classes`.
     """
     classes = classes or list(per_class)
     grid = CONFIG["grid"]
@@ -422,8 +592,10 @@ def plot_baseline_grid(per_class, classes=None, methods=("ICE", "CRAFT", "FACE")
     ncols = len(groups) * n_images
 
     fig, axes = plt.subplots(len(classes), ncols,
-                             figsize=(1.5 * ncols, 1.8 * len(classes)))
+                             figsize=(1.5 * ncols, 1.7 * len(classes)),
+                             gridspec_kw={"wspace": 0.05, "hspace": 0.14})
     axes = np.atleast_2d(axes)
+    fig.subplots_adjust(left=0.12)                     # room for rotated class labels
     for row, name in enumerate(classes):
         d = per_class[name]
         imgs224 = [clip_preprocess(im) for im in d["images"]]
@@ -448,52 +620,51 @@ def plot_baseline_grid(per_class, classes=None, methods=("ICE", "CRAFT", "FACE")
                     if m == "ICE":
                         ax.imshow(imgs224[im_idx])
                         ax.contour(_heatmap(Sr[im_idx, :, top], grid),
-                                   levels=[0.6], colors="red", linewidths=1.5)
+                                   levels=[ICE_CONTOUR_LEVEL], colors=CONTOUR_COLOR,
+                                   linewidths=1.5)
                     else:
                         cell = int(per_img[im_idx].argmax())
                         ax.imshow(_crop_patch(imgs224[im_idx], cell, grid, patch_cells))
                 ax.axis("off")
         # class label at the left margin
-        axes[row, 0].annotate(name, xy=(0, 0.5), xytext=(-12, 0), xycoords="axes fraction",
-                              textcoords="offset points", ha="right", va="center",
-                              rotation=90, fontsize=11)
+        _side_label(axes[row, 0], _pretty_class(name), size=FS_LABEL, wrap=12)
 
     # group headers centered over each block (top row)
     for gi, g in enumerate(groups):
         center = axes[0, gi * n_images + n_images // 2]
-        center.set_title(g, fontsize=11)
-
-    path = os.path.join(CONFIG["viz_dir"], out_name)
-    plt.tight_layout()
-    plt.savefig(path, dpi=130, bbox_inches="tight")
-    plt.show()
-    print(f"[viz] saved {path}")
-    return path
+        center.set_title(g, fontsize=FS_TITLE)
+    return _save(fig, out_name)
 
 
 def plot_lgmd_panel(per_class, classes=None, top_concepts=3, n_patches=3, patch_cells=3,
                     ncols_blocks=2, out_name="fig2_lgmd_panel.png"):
     """Fig 2 bottom (multi-class, LGMD): one block per class, each showing its top named
     concepts by their top-activating image patches — the paper's "Language Guided Concept
-    Discovery" panel. Concept names label each patch row.
+    Discovery" panel. Concept names label each patch row. Blocks fill left-to-right,
+    top-to-bottom in the order of `classes`.
     """
     classes = classes or list(per_class)
     grid = CONFIG["grid"]
     hw = grid * grid
     nrows_blocks = math.ceil(len(classes) / ncols_blocks)
 
-    fig = plt.figure(figsize=(5.2 * ncols_blocks, 1.1 * top_concepts * nrows_blocks + 1))
+    fig = plt.figure(figsize=(5.4 * ncols_blocks, 1.15 * top_concepts * nrows_blocks + 1))
     subfigs = np.atleast_1d(fig.subfigures(nrows_blocks, ncols_blocks)).ravel()
+    for sf in subfigs:                                 # keep unused blocks blank & clean
+        sf.set_facecolor("white")
     for bi, name in enumerate(classes):
         sf = subfigs[bi]
-        sf.suptitle(name, fontsize=12)
+        sf.suptitle(_pretty_class(name), fontsize=FS_TITLE, fontweight="semibold")
         d = per_class[name]
         imgs224 = [clip_preprocess(im) for im in d["images"]]
         concepts = d["concepts"]
         S = torch.as_tensor(d["S_hat"]).reshape(len(imgs224), hw, len(concepts))
         chosen = torch.argsort(S.sum(dim=(0, 1)), descending=True)[:top_concepts].tolist()
 
-        axs = np.atleast_2d(sf.subplots(top_concepts, n_patches))
+        # reserve left margin so the rotated concept labels have room and are not clipped
+        axs = np.atleast_2d(sf.subplots(top_concepts, n_patches,
+                                        gridspec_kw={"left": 0.32, "wspace": 0.05,
+                                                     "hspace": 0.08}))
         for r_i, k in enumerate(chosen):
             per_img = S[:, :, k]
             order = torch.argsort(per_img.max(1).values, descending=True)[:n_patches].tolist()
@@ -504,14 +675,8 @@ def plot_lgmd_panel(per_class, classes=None, top_concepts=3, n_patches=3, patch_
                     cell = int(per_img[im_idx].argmax())
                     ax.imshow(_crop_patch(imgs224[im_idx], cell, grid, patch_cells))
                 ax.axis("off")
-            axs[r_i, 0].annotate(concepts[k], xy=(0, 0.5), xytext=(-10, 0),
-                                 xycoords="axes fraction", textcoords="offset points",
-                                 ha="right", va="center", rotation=90, fontsize=9,
-                                 color="tab:blue")
-    # any unused blocks (when len(classes) < grid slots) simply render empty
-
-    path = os.path.join(CONFIG["viz_dir"], out_name)
-    plt.savefig(path, dpi=130, bbox_inches="tight")
-    plt.show()
-    print(f"[viz] saved {path}")
-    return path
+            # wrap long clinical phrases onto stacked lines so the (rotated) text stays
+            # within its row instead of overflowing the block edge
+            _side_label(axs[r_i, 0], concepts[k], color=CONCEPT_COLOR,
+                        size=FS_CONCEPT, wrap=14)
+    return _save(fig, out_name)
