@@ -1,10 +1,16 @@
 """Turn the IDRiD "Disease Grading" download into a 5-grade train/val/test ImageFolder.
 
-IDRiD (Indian Diabetic Retinopathy Image Dataset) ships its grading sub-dataset as a flat
-image folder (Training Set / Testing Set) plus two label CSVs (Image name -> Retinopathy
-grade 0..4 + a DME risk we ignore) — not the `<split>/<grade>/*.jpg` ImageFolder layout the
-rest of this pipeline (train_backbone, data_utils, torchvision.ImageFolder) assumes. This
-module bridges the two.
+IDRiD (Indian Diabetic Retinopathy Image Dataset) officially ships its grading sub-dataset
+as a flat image folder (Training Set / Testing Set) plus two label CSVs (Image name ->
+Retinopathy grade 0..4 + a DME risk we ignore) — not the `<split>/<grade>/*.jpg` ImageFolder
+layout the rest of this pipeline (train_backbone, data_utils, torchvision.ImageFolder)
+assumes. This module bridges the two.
+
+Some Kaggle mirrors of IDRiD (e.g. mariaherrerot/idrid-dataset) don't preserve that two-CSV
+layout: they ship a single `idrid_labels.csv` with columns `id_code`/`diagnosis`, where the
+train/test split is instead baked into `id_code` itself (test rows have "test" appended,
+e.g. `IDRiD_103test`, matching an image file `IDRiD_103test.jpg`). This module detects and
+handles both layouts.
 
 Split policy (IDRiD has no official validation set): IDRiD's Testing Set becomes `test/`,
 and its Training Set is stratified-split (per grade) into `train/` + `val/`.
@@ -81,12 +87,31 @@ def _index_images(base):
     return merged
 
 
-def _find_grading_csvs(base):
-    """Locate IDRiD's grading label CSVs by content (header carries 'Retinopathy grade').
+# --------------------------------------------------------------------------------------
+# Locating labels: official IDRiD two-CSV layout, or a single-CSV mirror layout
+# --------------------------------------------------------------------------------------
+def _has_grade_header(csv_path):
+    """True if the CSV's header contains a 'Retinopathy grade' column (official IDRiD)."""
+    try:
+        with open(csv_path, newline="", encoding="utf-8-sig") as fh:
+            header = next(csv.reader(fh), [])
+    except (OSError, UnicodeDecodeError):
+        return False
+    return any("retinopathy grade" in (c or "").strip().lower() for c in header)
 
-    Returns {"train": path, "test": path}; the two are told apart by 'train'/'test' in the
-    file path. Raises if the grading CSVs aren't in this download.
-    """
+
+def _has_id_diagnosis_header(csv_path):
+    """True if the CSV's header looks like the mariaherrerot mirror (id_code/diagnosis)."""
+    try:
+        with open(csv_path, newline="", encoding="utf-8-sig") as fh:
+            header = [(c or "").strip().lower() for c in next(csv.reader(fh), [])]
+    except (OSError, UnicodeDecodeError):
+        return False
+    return "id_code" in header and "diagnosis" in header
+
+
+def _find_official_csvs(base):
+    """Locate IDRiD's official two label CSVs (train/test told apart by path)."""
     found = {}
     for root, _dirs, files in os.walk(base):
         for f in files:
@@ -100,33 +125,58 @@ def _find_grading_csvs(base):
                 found.setdefault("test", path)
             elif "train" in low:
                 found.setdefault("train", path)
-    if "train" not in found or "test" not in found:
-        raise FileNotFoundError(
-            "Could not find IDRiD 'Disease Grading' label CSVs (with a 'Retinopathy grade' "
-            f"column, split into train/test) under {base}. Found: {found or 'none'}. Make "
-            "sure the download includes the 'B. Disease Grading' part, or pass "
-            "prepare(slug=<a slug that contains it>) / prepare(raw_root=<local IDRiD dir>)."
-        )
-    print(f"[dr_prep] grading labels: train={os.path.basename(found['train'])!r} "
-          f"test={os.path.basename(found['test'])!r}")
-    return found
+    if "train" in found and "test" in found:
+        return found
+    return None
 
 
-def _has_grade_header(csv_path):
-    """True if the CSV's header contains a 'Retinopathy grade' column."""
-    try:
-        with open(csv_path, newline="", encoding="utf-8-sig") as fh:
-            header = next(csv.reader(fh), [])
-    except (OSError, UnicodeDecodeError):
-        return False
-    return any("retinopathy grade" in (c or "").strip().lower() for c in header)
+def _find_single_labels_csv(base):
+    """Locate a single-CSV mirror's labels file (e.g. mariaherrerot's idrid_labels.csv)."""
+    for root, _dirs, files in os.walk(base):
+        for f in files:
+            if not f.lower().endswith(".csv"):
+                continue
+            path = os.path.join(root, f)
+            if _has_id_diagnosis_header(path):
+                return path
+    return None
+
+
+def _locate_labels(base):
+    """Find IDRiD grading labels under `base`, in whichever layout the download uses.
+
+    Returns a dict:
+        {"mode": "official", "train": path, "test": path}   -- two CSVs, official layout
+        {"mode": "single", "path": path}                      -- one CSV, mirror layout
+    Raises FileNotFoundError if neither layout is found.
+    """
+    official = _find_official_csvs(base)
+    if official is not None:
+        print(f"[dr_prep] grading labels (official layout): "
+              f"train={os.path.basename(official['train'])!r} "
+              f"test={os.path.basename(official['test'])!r}")
+        return {"mode": "official", **official}
+
+    single = _find_single_labels_csv(base)
+    if single is not None:
+        print(f"[dr_prep] grading labels (single-CSV mirror layout): "
+              f"{os.path.basename(single)!r}")
+        return {"mode": "single", "path": single}
+
+    raise FileNotFoundError(
+        "Could not find IDRiD 'Disease Grading' labels under "
+        f"{base}. Looked for either the official 'Image name'/'Retinopathy grade' "
+        "train+test CSV pair, or a single 'id_code'/'diagnosis' CSV (mariaherrerot-style "
+        "mirror). Make sure the download includes the 'B. Disease Grading' part, or pass "
+        "prepare(slug=<a slug that contains it>) / prepare(raw_root=<local IDRiD dir>)."
+    )
 
 
 # --------------------------------------------------------------------------------------
 # Labeling
 # --------------------------------------------------------------------------------------
-def _read_grades(csv_path):
-    """Yield (image_stem, grade:int) from an IDRiD grading CSV, skipping blank/bad rows."""
+def _read_grades_official(csv_path):
+    """Yield (image_stem, grade:int) from an official IDRiD grading CSV."""
     with open(csv_path, newline="", encoding="utf-8-sig") as fh:
         reader = csv.DictReader(fh)
         cols = {(c or "").strip().lower(): c for c in (reader.fieldnames or [])}
@@ -150,9 +200,72 @@ def _read_grades(csv_path):
                 yield os.path.splitext(name)[0], grade
 
 
+def _read_grades_single(csv_path):
+    """Yield (image_stem, grade:int, split:str) from a single-CSV mirror's labels file.
+
+    Split is inferred from id_code: rows whose id_code ends with "test" (e.g.
+    'IDRiD_103test') are test-set; all others are train-set. image_stem is the id_code
+    itself, since this mirror's image files are named f"{id_code}.jpg" exactly (the "test"
+    suffix, if any, is part of both the id_code and the filename).
+    """
+    with open(csv_path, newline="", encoding="utf-8-sig") as fh:
+        reader = csv.DictReader(fh)
+        cols = {(c or "").strip().lower(): c for c in (reader.fieldnames or [])}
+        f_id = cols.get("id_code")
+        f_grade = cols.get("diagnosis")
+        if not (f_id and f_grade):
+            raise ValueError(
+                f"{os.path.basename(csv_path)} lacks 'id_code'/'diagnosis' columns. "
+                f"Columns: {reader.fieldnames}"
+            )
+        for row in reader:
+            stem = (row.get(f_id) or "").strip()
+            raw = (row.get(f_grade) or "").strip()
+            if not stem or raw == "":
+                continue
+            try:
+                grade = int(float(raw))
+            except ValueError:
+                continue
+            if grade not in GRADE_TO_FOLDER:
+                continue
+            split = "test" if stem.lower().endswith("test") else "train"
+            yield stem, grade, split
+
+
 def _resolve(stem, images):
     """Absolute image path for a CSV stem, trying stem then stem+ext then basename."""
     return images.get(stem) or images.get(os.path.basename(stem))
+
+
+def _collect_by_grade(source, images):
+    """Bucket resolved image paths by (split, grade) for either label-source layout.
+
+    Returns (train_by_grade, test_by_grade, missing_count).
+    """
+    train_by_grade = {g: [] for g in GRADE_TO_FOLDER}
+    test_by_grade = {g: [] for g in GRADE_TO_FOLDER}
+    missing = 0
+
+    if source["mode"] == "official":
+        buckets = (("train", train_by_grade), ("test", test_by_grade))
+        for split_name, bucket in buckets:
+            for stem, grade in _read_grades_official(source[split_name]):
+                path = _resolve(stem, images)
+                if path is None:
+                    missing += 1
+                    continue
+                bucket[grade].append(path)
+    else:  # single-CSV mirror layout
+        for stem, grade, split in _read_grades_single(source["path"]):
+            path = _resolve(stem, images)
+            if path is None:
+                missing += 1
+                continue
+            bucket = train_by_grade if split == "train" else test_by_grade
+            bucket[grade].append(path)
+
+    return train_by_grade, test_by_grade, missing
 
 
 # --------------------------------------------------------------------------------------
@@ -204,21 +317,11 @@ def prepare(raw_root=None, slug=None, out_root=None, val_frac=0.2,
             return out_root
 
     raw_root = raw_root or _download(slug or IDRID_SLUG)
-    csvs = _find_grading_csvs(raw_root)
+    source = _locate_labels(raw_root)
     images = _index_images(raw_root)
     print(f"[dr_prep] indexed {len(set(images.values()))} grading images under {raw_root}")
 
-    # IDRiD Training Set -> stratified train/val; IDRiD Testing Set -> test.
-    train_by_grade = {g: [] for g in GRADE_TO_FOLDER}
-    test_by_grade = {g: [] for g in GRADE_TO_FOLDER}
-    missing = 0
-    for split_csv, bucket in (("train", train_by_grade), ("test", test_by_grade)):
-        for stem, grade in _read_grades(csvs[split_csv]):
-            path = _resolve(stem, images)
-            if path is None:
-                missing += 1
-                continue
-            bucket[grade].append(path)
+    train_by_grade, test_by_grade, missing = _collect_by_grade(source, images)
     if missing:
         print(f"[dr_prep] {missing} labeled rows had no matching image file (skipped).")
 

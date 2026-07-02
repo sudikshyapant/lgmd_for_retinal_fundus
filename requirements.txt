@@ -1,5 +1,6 @@
 torch
 torchvision
+timm            # RETFound MAE ViT-L/16 architecture (vit_large_patch16_224)
 transformers
 git+https://github.com/jusiro/FLAIR.git   # retinal FLAIR VLM (imports as `flair`); pulls transformers
 datasets

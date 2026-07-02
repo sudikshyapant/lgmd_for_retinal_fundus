@@ -35,7 +35,7 @@ DEVICE = model_utils.DEVICE
 
 def _mean_std():
     """ImageNet mean/std the active backbone was pretrained with (also used at LGMD time)."""
-    if CONFIG["backbone"] == "retfound_dinov2":
+    if CONFIG["backbone"].startswith("retfound"):
         return model_utils._IMAGENET_MEAN, model_utils._IMAGENET_STD
     _, weights = model_utils._BACKBONES[CONFIG["backbone"]]
     base = weights.transforms()
@@ -116,7 +116,7 @@ def train(n_per_class=None, epochs=None, lr=None, batch_size=None, seed=None):
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
                             num_workers=2, pin_memory=True)
     # RETFound linear probe: freeze the foundation encoder, train only the head.
-    is_retfound = CONFIG["backbone"] == "retfound_dinov2"
+    is_retfound = CONFIG["backbone"].startswith("retfound")
     if is_retfound:
         for p in model.backbone.parameters():
             p.requires_grad = False

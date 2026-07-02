@@ -92,6 +92,24 @@ _ATTRIBUTE_TERMS = [
 ]
 
 
+# --- backbone switch ---------------------------------------------------------
+# Pick the encoder here; arch / checkpoint filename / probing grid all derive from it so
+# the RETFound variants stay mutually consistent. RETFound comes in two flavors:
+#   retfound_mae    — MAE ViT-L/16 (patch 16 -> 14x14 native tokens); the original
+#                     RETFound (Nature 2023). CFP encoder: RETFound_mae_natureCFP.pth.
+#   retfound_dinov2 — DINOv2 ViT-L/14 (patch 14 -> 16x16 native tokens). No CFP-specific
+#                     checkpoint exists publicly; the MEH weight is the color-fundus one.
+# The torchvision conv backbones (densenet121/resnet34/resnet50/mobilenet_v2) bypass this
+# block entirely (they set their own arch/grid in model_utils).
+_BACKBONE = "retfound_mae"   # retfound_mae | retfound_dinov2 | densenet121 | resnet34 | resnet50 | mobilenet_v2
+_IS_MAE = _BACKBONE == "retfound_mae"
+_RETFOUND_ARCH = "vit_large_patch16_224" if _IS_MAE else "dinov2_vitl14"
+_RETFOUND_CKPT = "RETFound_mae_natureCFP.pth" if _IS_MAE else "retfound_dinov2_cfp.pth"
+# Native token grid = img_size / patch: 14 for MAE (224/16), 16 for DINOv2 (224/14).
+# Probing grid must divide it so GAP == mean-over-tokens stays exact: 7 for MAE, 8 for DINOv2.
+_GRID = 7 if _IS_MAE else 8
+
+
 # NOTE: keys tagged [suppl] are NOT specified in the paper body — their exact values
 # live in the paper's supplementary material. The values here are informed defaults;
 # change them in this one place once the supplementary is available.
@@ -126,27 +144,30 @@ CONFIG = {
     "seed": 0,
 
     # --- backbone (encoder f + classifier head g) -----------------------------
-    # The classifier LGMD explains. Default: RETFound (DINOv2 ViT-L/14) used as a FROZEN
+    # The classifier LGMD explains. Default: RETFound (MAE ViT-L/16) used as a FROZEN
     # foundation encoder with a linear DR-grading head probed on top (train_backbone.py).
     # The encoder is NOT fine-tuned — only the Linear(1024 -> num_classes) head is trained,
     # and backbone_weights stores just that head. The torchvision conv backbones
     # (densenet121/resnet34/resnet50/mobilenet_v2) still work via model_utils._BACKBONES.
-    "backbone": "retfound_dinov2", # "retfound_dinov2" | "densenet121" | "resnet34" | "resnet50" | "mobilenet_v2"
+    # Select the backbone at the _BACKBONE switch above (not here).
+    "backbone": _BACKBONE,
     "num_classes": 5,              # 5 DR severity grades (checked against the folders)
     "feat_dim": 1024,              # p — encoder channels (ViT-L / densenet121 both = 1024)
-    "backbone_weights": os.path.join(CACHE_DIR, "retfound_dinov2_head_dr.pt"),  # trained linear head only
-    # RETFound (DINOv2) foundation encoder: architecture fetched from torch.hub
-    # (facebookresearch/dinov2); SSL weights loaded from retfound_weights. Switch
-    # retfound_arch to 'dinov2_vitl14_reg' if your checkpoint is the register-token variant.
-    "retfound_arch": "dinov2_vitl14",
-    "retfound_img_size": 224,      # 224/14 = 16x16 native token grid (pooled to CONFIG['grid'])
-    "retfound_weights": os.path.join(CACHE_DIR, "retfound_dinov2_cfp.pth"),  # RETFound SSL encoder ckpt
+    # Trained linear head only; per-backbone filename so a DINOv2-trained head is never
+    # loaded onto the MAE encoder (they share the Linear shape but live in different feature spaces).
+    "backbone_weights": os.path.join(CACHE_DIR, f"{_BACKBONE}_head_dr.pt"),
+    # RETFound foundation encoder architecture: MAE built via timm (vit_large_patch16_224),
+    # DINOv2 fetched from torch.hub (facebookresearch/dinov2; use 'dinov2_vitl14_reg' for the
+    # register-token variant). SSL weights loaded from retfound_weights.
+    "retfound_arch": _RETFOUND_ARCH,
+    "retfound_img_size": 224,      # MAE: 224/16 = 14x14 native tokens; DINOv2: 224/14 = 16x16
+    "retfound_weights": os.path.join(CACHE_DIR, _RETFOUND_CKPT),  # RETFound SSL encoder ckpt
     # Backbone preprocessing: "clip_shared_224" shares CLIP's exact 224 crop so encoder
     # feature cells and CLIP red-circle cells cover identical pixels (aligns A_bar <-> S).
     # Part of the activation cache key so changing it recomputes activations.
     "backbone_preprocess": "clip_shared_224",
-    "grid": 8,                     # h = w — encoder / CLIP probing grid. 8x8 = exact 2x2 pool of
-                                   # DINOv2's 16x16 token grid (conv backbones used 7x7; A1.6).
+    "grid": _GRID,                 # h = w — encoder / CLIP probing grid. Exact 2x2 pool of the
+                                   # native token grid: 7x7 for MAE (14), 8x8 for DINOv2 (16); A1.6.
 
     # --- backbone training (train_backbone.py) --------------------------------
     "train_epochs": 15,            # fine-tuning epochs on the n_per_class subset
@@ -160,7 +181,8 @@ CONFIG = {
     # fundus images, so its image-text space is domain-matched to retinal pathology.
     "flair_weights": None,         # FLAIR checkpoint path; None -> download pretrained weights
     "prompt_template": "a fundus photograph showing {}",  # medical text prompt for concepts
-    "circle_radius": 14,           # [suppl] red-circle radius (px) — sized to the 8x8 grid cell (224/8=28px)
+    "circle_radius": round(112 / _GRID),  # [suppl] red-circle radius (px) — half a grid cell
+                                   # (224/grid/2): 16 for the 7x7 MAE grid, 14 for the 8x8 DINOv2 grid
     "circle_width": 3,             # [suppl] red-circle stroke width (px) — "thin" outline, value unspecified
     "circle_color": "red",         # red localization marker (suppl. A1.6)
 

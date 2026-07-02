@@ -32,7 +32,7 @@ _BACKBONES = {
 
 def _is_retfound(model):
     import retfound
-    return isinstance(model, retfound.RETFoundDINOv2)
+    return isinstance(model, retfound._RETFoundBase)
 
 
 def _aligned_transform(weights):
@@ -87,7 +87,7 @@ def build_backbone(name=None, pretrained=True):
     """
     from config import CONFIG
     name = name or CONFIG["backbone"]
-    if name == "retfound_dinov2":
+    if name.startswith("retfound"):
         import retfound
         # The RETFound SSL encoder is always loaded (it *is* the foundation model); the
         # `pretrained` flag only governs torchvision ImageNet inits, which don't apply here.
@@ -117,7 +117,7 @@ def load_backbone(name=None):
         )
     model, transform = build_backbone(name, pretrained=False)
     state = torch.load(wpath, map_location=DEVICE)
-    if name == "retfound_dinov2":
+    if name.startswith("retfound"):
         model.head.load_state_dict(state)   # linear probe: only the head was trained/saved
     else:
         model.load_state_dict(state)
