@@ -2,11 +2,12 @@
 
 The predictor g(f(x)) is split into:
   - encoder f: image -> spatial feature map Z (n, p, h, w)
-  - head    g: Z -> logits, via global average pooling + the pretrained classifier
+  - head    g: Z -> logits, via global average pooling + the classifier
 
-Supports DenseNet-121 (the active backbone for the ODIR-5K classifier) plus the paper's
-ResNet34 / MobileNetV2 and ResNet50; all share the same encoder/head abstraction so the
-rest of the pipeline is backbone-agnostic.
+Default backbone is RETFound (DINOv2 ViT-L/14): a frozen foundation encoder whose
+patch tokens form the (n, p, grid, grid) map, with a linear DR-grading head on top
+(see retfound.py). The torchvision conv backbones (DenseNet-121, ResNet34/50,
+MobileNetV2) share the same abstraction, so the rest of the pipeline is backbone-agnostic.
 """
 
 import torch
@@ -16,12 +17,22 @@ from tqdm import tqdm
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+# ImageNet normalization stats (RETFound/DINOv2 preprocessing; the conv backbones read
+# theirs off the torchvision weights enum instead).
+_IMAGENET_MEAN = (0.485, 0.456, 0.406)
+_IMAGENET_STD = (0.229, 0.224, 0.225)
+
 _BACKBONES = {
     "densenet121":  (torchvision.models.densenet121,  torchvision.models.DenseNet121_Weights.IMAGENET1K_V1),
     "resnet34":     (torchvision.models.resnet34,     torchvision.models.ResNet34_Weights.IMAGENET1K_V1),
     "resnet50":     (torchvision.models.resnet50,     torchvision.models.ResNet50_Weights.IMAGENET1K_V2),
     "mobilenet_v2": (torchvision.models.mobilenet_v2, torchvision.models.MobileNet_V2_Weights.IMAGENET1K_V2),
 }
+
+
+def _is_retfound(model):
+    import retfound
+    return isinstance(model, retfound.RETFoundDINOv2)
 
 
 def _aligned_transform(weights):
@@ -40,6 +51,16 @@ def _aligned_transform(weights):
 
     base = weights.transforms()                          # exposes ImageNet mean/std
     normalize = Compose([ToTensor(), Normalize(base.mean, base.std)])
+    return lambda img: normalize(clip_preprocess(img))
+
+
+def _retfound_transform():
+    """RETFound/DINOv2 preprocessing: CLIP-shared 224 crop + ImageNet ToTensor/Normalize."""
+    from torchvision.transforms import Compose, Normalize, ToTensor
+
+    from data_utils import clip_preprocess
+
+    normalize = Compose([ToTensor(), Normalize(_IMAGENET_MEAN, _IMAGENET_STD)])
     return lambda img: normalize(clip_preprocess(img))
 
 
@@ -66,6 +87,12 @@ def build_backbone(name=None, pretrained=True):
     """
     from config import CONFIG
     name = name or CONFIG["backbone"]
+    if name == "retfound_dinov2":
+        import retfound
+        # The RETFound SSL encoder is always loaded (it *is* the foundation model); the
+        # `pretrained` flag only governs torchvision ImageNet inits, which don't apply here.
+        model = retfound.build(CONFIG["num_classes"], load_pretrained=True)
+        return model.to(DEVICE), _retfound_transform()
     ctor, weights = _BACKBONES[name]
     model = ctor(weights=weights if pretrained else None)
     _replace_head(model, name, CONFIG["num_classes"])
@@ -89,7 +116,11 @@ def load_backbone(name=None):
             f"first to fine-tune the backbone on the fundus dataset."
         )
     model, transform = build_backbone(name, pretrained=False)
-    model.load_state_dict(torch.load(wpath, map_location=DEVICE))
+    state = torch.load(wpath, map_location=DEVICE)
+    if name == "retfound_dinov2":
+        model.head.load_state_dict(state)   # linear probe: only the head was trained/saved
+    else:
+        model.load_state_dict(state)
     return model.eval(), transform
 
 
@@ -103,6 +134,8 @@ def _is_densenet(model):
 
 def encoder(model, x):
     """f: input images -> spatial feature map Z (n, p, h, w)."""
+    if _is_retfound(model):
+        return model.feature_map(x)                      # (n, 1024, grid, grid)
     if _is_mobilenet(model):
         return model.features(x)                         # (n, 1280, 7, 7)
     if _is_densenet(model):
@@ -121,6 +154,8 @@ def classify_pooled(model, a):
 
     Grad-enabled and architecture-aware (used directly, and by FACE's KL term).
     """
+    if _is_retfound(model):
+        return model.classify(a)
     if _is_mobilenet(model) or _is_densenet(model):
         return model.classifier(a)
     return model.fc(a)
@@ -134,7 +169,7 @@ def head(model, z):
 
 @torch.no_grad()
 def extract_activations(model, transform, images, batch_size=16, desc="activations"):
-    """Run the encoder over images, returning Z (n, p, 7, 7) on CPU (p = feat_dim)."""
+    """Run the encoder over images, returning Z (n, p, grid, grid) on CPU (p = feat_dim)."""
     feats = []
     for i in tqdm(range(0, len(images), batch_size), desc=desc):
         batch = torch.stack([transform(im) for im in images[i:i + batch_size]]).to(DEVICE)

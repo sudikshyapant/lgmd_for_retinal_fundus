@@ -1,6 +1,6 @@
 """Drive the LGMD pipeline across the 40-class ImageNet benchmark.
 
-The backbone and CLIP are class-independent, so they are loaded once and reused. For
+The backbone and VLM are class-independent, so they are loaded once and reused. For
 each class we select it (config.select_class sets class_name / synset / index), then run
 data -> activations -> concepts -> S -> W -> inference -> metrics + baselines. Every heavy
 artifact is cached per class via cache_name() (the "data"/"con" groups key on the active
@@ -15,11 +15,13 @@ Usage (from the notebook, after the sys.path setup cell):
 
 import os
 
+import torch
+
 import utils
 import data_utils
 import model_utils
 import concepts as concept_mod
-import clip_maps
+import flair_maps
 import lgmd
 import baselines
 import metrics
@@ -30,47 +32,70 @@ from config import (CONFIG, FIGURE_CLASSES, cache_name, select_class,
 DEVICE = model_utils.DEVICE
 
 
-def run_class(name, model, transform, clip, make_figures=False):
-    """Run the full LGMD pipeline for one class and return its metrics + concepts.
+def class_basis(name, model, transform, vlm):
+    """Steps 1-5 of run_class: fit (or load) one class's concept basis.
 
-    `model`, `transform`, `clip` are the shared (class-independent) backbone and CLIP.
-    Set `make_figures` to also save concept-overlay images for this class.
+    Returns (concepts, W, Z_train) — the class concept list, its learned semantic basis W,
+    and the train-split activations (shape reused for baselines). Cache keys are identical
+    to run_class's, so run_class and the lesion-localization eval share the same artifacts.
     """
     select_class(name)                                  # sets class_name / index
-    CDIR, RDIR, bb = CONFIG["cache_dir"], CONFIG["results_dir"], CONFIG["backbone"]
-    cls, label, seed = CONFIG["class_name"], CONFIG["class_index"], CONFIG["seed"]
+    CDIR, seed, cls = CONFIG["cache_dir"], CONFIG["seed"], CONFIG["class_name"]
 
-    # 1. data — fit the concept basis on train-split images, evaluate on val-split images
+    # 1. data + 2. encoder activations (cache key: data + model)
     train_imgs = data_utils.load_class_images(cls, CONFIG["n_train"], "train_dir", seed)
-    val_imgs = data_utils.load_class_images(cls, CONFIG["n_val"], "val_dir", seed)
-
-    # 2. encoder activations (cache key: data + model)
     Z_train = utils.cached(os.path.join(CDIR, cache_name("Z_train", ".pt", "data", "model")),
         lambda: model_utils.extract_activations(model, transform, train_imgs, desc=f"{name} train act"))
-    Z_val = utils.cached(os.path.join(CDIR, cache_name("Z_val", ".pt", "data", "model")),
-        lambda: model_utils.extract_activations(model, transform, val_imgs, desc=f"{name} val act"))
-    A_train = lgmd.unfold(Z_train)
 
-    # 3. concepts — shared bank, or per-class two-stage filter (cache key: con)
-    concept_list = concept_mod.get_concepts(clip, images=train_imgs)
-
-    # 4. localized CLIP similarity maps S (cache key: data + con + clip)
+    # 3. concepts (cache key: con) + 4. localized VLM similarity maps S (data + con + clip)
+    concept_list = concept_mod.get_concepts(vlm, images=train_imgs)
     S_train = utils.cached(os.path.join(CDIR, cache_name("S_train", ".pt", "data", "con", "clip")),
-        lambda: clip_maps.build_S(train_imgs, concept_list, clip))
+        lambda: flair_maps.build_S(train_imgs, concept_list, vlm))
 
     # 5. fit semantic concept basis W via PGD (cache key: data + model + con + clip + pgd)
     W = utils.cached(os.path.join(CDIR, cache_name("W", ".pt", "data", "model", "con", "clip", "pgd")),
-        lambda: lgmd.fit_basis(A_train, S_train))
+        lambda: lgmd.fit_basis(lgmd.unfold(Z_train), S_train))
+    return concept_list, W, Z_train
 
-    # 6. inference on correctly-classified val samples (Sec 4)
+
+def run_class(name, model, transform, vlm, make_figures=False):
+    """Run the full LGMD pipeline for one class and return its metrics + concepts.
+
+    `model`, `transform`, `vlm` are the shared (class-independent) backbone and VLM.
+    Set `make_figures` to also save concept-overlay images for this class.
+    """
+    concept_list, W, Z_train = class_basis(name, model, transform, vlm)
+    CDIR, RDIR, bb = CONFIG["cache_dir"], CONFIG["results_dir"], CONFIG["backbone"]
+    cls, label, seed = CONFIG["class_name"], CONFIG["class_index"], CONFIG["seed"]
+    A_train = lgmd.unfold(Z_train)
+
+    # val data + activations (cache key: data + model)
+    val_imgs = data_utils.load_class_images(cls, CONFIG["n_val"], "val_dir", seed)
+    Z_val = utils.cached(os.path.join(CDIR, cache_name("Z_val", ".pt", "data", "model")),
+        lambda: model_utils.extract_activations(model, transform, val_imgs, desc=f"{name} val act"))
+
+    # 6. inference on the evaluation samples (Sec 4). Normally we explain only the val images
+    #    the backbone diagnoses correctly. But a scarce grade's weak head may get too few (or
+    #    zero) right, which would leave an empty eval set and skip the grade. So when fewer
+    #    than min_eval_images are correct we fall back to ALL val images and rely on
+    #    prediction *agreement* (label-independent) rather than correct-diagnosis preservation.
     orig_logits_full = model_utils.logits_from_Z(model, Z_val)
     keep = orig_logits_full.argmax(-1) == label
     n_diag_total = int(keep.numel())                    # val images seen by the backbone
-    n_diag_correct = int(keep.sum())                    # correctly diagnosed -> get heatmaps
-    Z_val = Z_val[keep]
-    val_imgs = [im for im, k in zip(val_imgs, keep.tolist()) if k]
+    n_diag_correct = int(keep.sum())                    # correctly diagnosed
+    eval_on_all = n_diag_correct < CONFIG["min_eval_images"]
+    eval_mask = torch.ones_like(keep) if eval_on_all else keep
+    if int(eval_mask.sum()) == 0:
+        raise RuntimeError(f"{cls}: no val images to evaluate (val split is empty).")
+    if eval_on_all:
+        print(f"[thin grade] {cls}: {n_diag_correct}/{n_diag_total} val images diagnosed "
+              f"correctly (< {CONFIG['min_eval_images']}); evaluating on all "
+              f"{int(eval_mask.sum())} val images (agreement-based).")
+    Z_val = Z_val[eval_mask]
+    val_imgs = [im for im, k in zip(val_imgs, eval_mask.tolist()) if k]
+    n_eval = len(val_imgs)                               # images actually scored below
     A_val = lgmd.unfold(Z_val)
-    orig_logits = orig_logits_full[keep]
+    orig_logits = orig_logits_full[eval_mask]
     S_hat = lgmd.infer(A_val, W)
     A_hat = lgmd.reconstruct(S_hat, W, Z_val.shape)
 
@@ -126,19 +151,22 @@ def run_class(name, model, transform, clip, make_figures=False):
                                       "data", "model", "con", "clip", "pgd", "infer", "base", "cins")),
         _comparison)
 
-    # counts behind the heatmaps: images the backbone diagnosed correctly (every overlay is
-    # drawn on one of these), and how many of those keep the diagnosis after concept recon.
-    n_recon_correct = round(lgmd_metrics["recon_acc"] * n_diag_correct)
+    # counts behind the heatmaps: the evaluation images (diagnosed-correct, or — for a thin
+    # grade in the eval_on_all fallback — all val images) and how many keep the true-grade
+    # prediction after concept reconstruction. n_eval >= 1 here, so recon_acc is never nan.
+    recon_acc = lgmd_metrics["recon_acc"]
+    n_recon_correct = round(recon_acc * n_eval)
     result = {
         "class": cls, "index": label,
         "concepts": concept_list, "lgmd": lgmd_metrics, "comparison": comparison,
+        "eval_on_all": eval_on_all, "n_eval": n_eval,
         "diagnosed": {
             "correct": n_diag_correct, "total": n_diag_total,
             "acc": n_diag_correct / n_diag_total if n_diag_total else 0.0,
         },
         "concept_preserved": {
-            "correct": n_recon_correct, "of": n_diag_correct,
-            "acc": lgmd_metrics["recon_acc"],
+            "correct": n_recon_correct, "of": n_eval,
+            "acc": recon_acc,
         },
     }
 
@@ -215,6 +243,69 @@ def metric_table(results, metric="Acc", methods=("LGMD", "FACE", "ICE", "CRAFT")
     return {bb: per_class}
 
 
+def _grounding_for_class(name, vlm):
+    """FLAIR visual-grounding score per concept for one grade (uses the cached S_train).
+
+    Reuses the exact S_train cache key as class_basis, so if the grade has already been run
+    this just loads S; otherwise it builds it. Needs only the VLM (not the trained backbone).
+    Returns (concept_list, {"peak": tensor, "mean": tensor}).
+    """
+    select_class(name)
+    CDIR, seed, cls = CONFIG["cache_dir"], CONFIG["seed"], CONFIG["class_name"]
+    train_imgs = data_utils.load_class_images(cls, CONFIG["n_train"], "train_dir", seed)
+    concept_list = concept_mod.get_concepts(vlm, images=train_imgs)
+    S_train = utils.cached(os.path.join(CDIR, cache_name("S_train", ".pt", "data", "con", "clip")),
+        lambda: flair_maps.build_S(train_imgs, concept_list, vlm))
+    scores = metrics.concept_grounding(S_train, len(train_imgs), CONFIG["grid"])
+    return concept_list, scores
+
+
+def grounding_table(classes=None, print_table=True, save=True, plot=True, score="peak"):
+    """Per-concept FLAIR visual-grounding table AND figure for each grade.
+
+    For every class, scores how visually grounded each concept is via FLAIR's localized
+    similarity maps S — peak (strongest localized cell, averaged over images) and mean
+    (diffuse presence). No concept is dropped; this captures grounding while (with
+    concept_curated) every concept still passes into the basis. Emits three artifacts:
+    a printed per-grade table, a saved JSON, and a sorted bar/heatmap figure (viz).
+    Returns {grade: {concept: {"peak": float, "mean": float}}}.
+    """
+    classes = classes if classes is not None else fundus_class_names()
+    vlm = flair_maps.VLM()
+    out = {}
+    for name in classes:
+        try:
+            concepts, sc = _grounding_for_class(name, vlm)
+        except Exception as e:
+            print(f"[grounding] {name}: SKIPPED — {type(e).__name__}: {e}")
+            continue
+        cls = CONFIG["class_name"]
+        rows = {c: {"peak": float(sc["peak"][k]), "mean": float(sc["mean"][k])}
+                for k, c in enumerate(concepts)}
+        out[cls] = rows
+        if print_table:
+            _print_grounding(cls, rows)
+    if save and out:
+        import json
+        tag = CONFIG.get("run_tag", "") or "default"
+        path = os.path.join(CONFIG["results_dir"], f"concept_grounding_{tag}.json")
+        with open(path, "w") as f:
+            json.dump(out, f, indent=2)
+        print(f"\n[grounding] saved {path}")
+    if plot and out:
+        viz.plot_concept_grounding(out, score=score)
+    return out
+
+
+def _print_grounding(cls, rows):
+    """Per-concept grounding table for one grade, sorted by peak (most-grounded first)."""
+    print(f"\n[grounding] {cls} — FLAIR visual grounding per concept "
+          f"(peak = strongest localized cell mean over images):")
+    print(f"{'Concept':<34}{'Peak':>8}{'Mean':>8}")
+    for c, d in sorted(rows.items(), key=lambda kv: kv[1]["peak"], reverse=True):
+        print(f"{c[:34]:<34}{d['peak']:>8.3f}{d['mean']:>8.3f}")
+
+
 def run_all(classes=None, figure_classes=None):
     """Run the pipeline over `classes` (default: every dataset class).
 
@@ -222,7 +313,7 @@ def run_all(classes=None, figure_classes=None):
     error string, printed as a numbered list so the recovery cell can reference a class by
     its number.
 
-    Loads the backbone + CLIP once and reuses them. Overlays are saved only for classes in
+    Loads the backbone + VLM once and reuses them. Overlays are saved only for classes in
     `figure_classes` (default: FIGURE_CLASSES). A class that errors out (e.g. too few val
     images, or — in per_class mode — fewer than r concepts surviving filtering) is printed
     and skipped rather than aborting the whole run; every other class still completes and is
@@ -235,12 +326,12 @@ def run_all(classes=None, figure_classes=None):
     figset = {_canon(x) for x in fig_src}   # canonical -> tolerant of case/spacing
 
     model, transform = model_utils.load_backbone()
-    clip = clip_maps.CLIP()
+    vlm = flair_maps.VLM()
 
     results, failures = {}, {}
     for i, name in enumerate(classes, 1):
         try:
-            res = run_class(name, model, transform, clip, make_figures=_canon(name) in figset)
+            res = run_class(name, model, transform, vlm, make_figures=_canon(name) in figset)
             results[name] = res
             dg, cp = res["diagnosed"], res["concept_preserved"]
             print(f"[{i}/{len(classes)}] {name}: diagnosed {dg['correct']}/{dg['total']} "
@@ -260,7 +351,7 @@ def run_all(classes=None, figure_classes=None):
 def make_figures(classes=None):
     """Render the qualitative concept figures across the showcase classes.
 
-    Runs the pipeline for `classes` (default FIGURE_CLASSES, e.g. cataract), then renders
+    Runs the pipeline for `classes` (default FIGURE_CLASSES, e.g. moderate NPDR), then renders
     three multi-class figures:
       - fig1_concept_heatmaps_grid.png : input image + top named-concept heatmaps per class
       - fig2_baseline_grid.png         : Data Samples / ICE / CRAFT / FACE (no LGMD)
@@ -270,13 +361,13 @@ def make_figures(classes=None):
     classes = list(classes) if classes is not None else (
         list(FIGURE_CLASSES) if FIGURE_CLASSES is not None else fundus_class_names()[:1])
     model, transform = model_utils.load_backbone()
-    clip = clip_maps.CLIP()
+    vlm = flair_maps.VLM()
 
     per_class = {}
     for i, name in enumerate(classes, 1):
         print(f"[fig {i}/{len(classes)}] {name}")
         try:
-            per_class[name] = run_class(name, model, transform, clip, make_figures=True)["figure"]
+            per_class[name] = run_class(name, model, transform, vlm, make_figures=True)["figure"]
         except Exception as e:
             print(f"[fig {i}/{len(classes)}] {name}: SKIPPED — {type(e).__name__}: {e}")
     if not per_class:

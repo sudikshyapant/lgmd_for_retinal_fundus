@@ -88,3 +88,39 @@ def insertion_auc(curve):
     """
     c = torch.tensor(curve, dtype=torch.float32)
     return float(c.mean())
+
+
+def concept_grounding(S, n_images, grid):
+    """Per-concept FLAIR visual-grounding scores from the similarity matrix S.
+
+    S is (n_images * grid*grid, r): each column a concept, each value a clamped image-text
+    cosine similarity under red-circle localization (flair_maps.build_S). This measures how
+    well FLAIR grounds each concept in the images, without dropping any. Returns dict of
+    length-r tensors:
+      - peak: mean over images of each image's strongest cell (best localized evidence)
+      - mean: mean similarity over all cells and images (diffuse presence)
+    """
+    r = S.shape[1]
+    Sg = S.reshape(n_images, grid * grid, r)
+    return {
+        "peak": Sg.max(dim=1).values.mean(dim=0),       # (r,)
+        "mean": Sg.mean(dim=(0, 1)),                     # (r,)
+    }
+
+
+def heatmap_localization(heat, mask):
+    """Score one concept heatmap against a ground-truth lesion mask (same H x W).
+
+    `heat` is a normalized [0,1] concept heatmap; `mask` is a boolean lesion mask.
+    Returns:
+      - mass_in_mask: fraction of the heatmap's total activation that falls inside the
+        mask (0 if the heatmap is all-zero), i.e. how concentrated it is on the lesion.
+      - hit: pointing-game — True if the heatmap's peak pixel lies inside the mask.
+    """
+    heat = torch.as_tensor(heat, dtype=torch.float32)
+    mask = torch.as_tensor(mask, dtype=torch.bool)
+    total = float(heat.sum())
+    mass = float((heat[mask]).sum() / total) if total > 0 else 0.0
+    peak = int(heat.reshape(-1).argmax())
+    hit = bool(mask.reshape(-1)[peak])
+    return {"mass_in_mask": mass, "hit": hit}

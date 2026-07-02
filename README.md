@@ -2,7 +2,8 @@
 
 Post-hoc concept discovery for a 5-class retinal-fundus classifier. A fine-tuned **DenseNet-121**
 is explained with **named clinical concepts** via CLIP-guided matrix decomposition
-(`Ā ≈ S Wᵀ`), using **BiomedCLIP** for the concept maps `S`.
+(`Ā ≈ S Wᵀ`), using **FLAIR** (a foundation language-image model of the retina) for the
+concept maps `S`.
 
 ## Data
 
@@ -50,6 +51,29 @@ runner.make_figures()                        # concept overlays (default: catara
 `train_backbone.train()` must run first (it produces the weights `load_backbone` reads).
 A class that errors is printed and skipped; completed classes are cached and resume free.
 
+## Lesion-localization check (ground-truth masks)
+
+`runner.run_all` reports two correctness counts per class: **diagnosed** (how many val
+images the backbone classified correctly — every concept heatmap is drawn on one of these)
+and **concept-preserved** (of those, how many keep the diagnosis after concept
+reconstruction). See `runner.diagnosis_summary(results)`.
+
+To check whether the heatmaps land on the *right lesions*, [`src/lesion_eval.py`](src/lesion_eval.py)
+scores the Diabetes concept basis against **IDRiD** (Indian Diabetic Retinopathy Image
+Dataset) pixel lesion masks (microaneurysms / haemorrhages / hard & soft exudates / optic disc):
+
+```python
+import lesion_eval
+lesion_eval.run_localization()          # downloads IDRiD via kagglehub
+```
+
+Each DR concept is mapped to a lesion mask type by keyword (`concept_lesion_type`); vessel /
+neovascular concepts have no mask and are skipped. For every (image, concept) pair it
+computes a **pointing-game** hit (heatmap peak inside the mask) and **mass-in-mask**
+(fraction of heatmap energy on the lesion), then reports how many concepts localize
+(hit on ≥ half their images) and the overall heatmap hit rate. The Kaggle slug is
+`lesion_eval.IDRID_SLUG` (override with `run_localization(root=...)` if it moves).
+
 ## Key knobs (`src/config.py`)
 
 - `backbone` — `"densenet121"` (default; feat_dim 1024) or `"resnet34"` / `"resnet50"` / `"mobilenet_v2"`.
@@ -57,7 +81,7 @@ A class that errors is printed and skipped; completed classes are cached and res
 - `n_train` / `n_val` — images/class for fitting `W` / evaluating (default 100 / 50).
 - `concept_mode` — `"per_class"` (default) or `"shared"`.
 - `r` — concepts kept per class in per_class mode (default 25).
-- `clip_backend` — `"biomedclip"` (default) or `"openai"`.
+- `flair_weights` — local FLAIR checkpoint path, or `None` to download the pretrained retina weights.
 
 ## Concept vocabulary
 

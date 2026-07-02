@@ -97,41 +97,56 @@ _ATTRIBUTE_TERMS = [
 # change them in this one place once the supplementary is available.
 CONFIG = {
     # --- data -----------------------------------------------------------------
-    # ODIR-5K (Ocular Disease Intelligent Recognition), restricted to 5 single-label
-    # classes: Normal, Diabetes (DR), Glaucoma, Cataract, AMD. The raw ODIR-5K download
-    # is a flat image folder + a per-eye label table, so odir_prep.py first arranges it
-    # into the ImageFolder layout (<split>/<class>/*.jpg) the rest of the pipeline expects.
-    # The *active* class for concept discovery is set by select_class(name); class_index
-    # is its position in the sorted class list (matching torchvision ImageFolder ordering,
-    # so it lines up with the trained classifier's output index).
-    "data_root": os.path.join(CACHE_DIR, "odir5k_imagefolder"),  # built by odir_prep.prepare()
+    # DR severity grading: 5 ordinal classes 0-4 (No DR, Mild NPDR, Moderate NPDR,
+    # Severe NPDR, Proliferative DR). Arrange the dataset as <split>/<grade>/*.jpg for
+    # torchvision ImageFolder. IMPORTANT: ImageFolder assigns class indices by sorting
+    # the folder names alphabetically, and the classifier's output index must match. Name
+    # the folders with a numeric prefix so alphabetical order == grade order — the
+    # convention used throughout this config (and in concept_vocab.json):
+    #     0_no_dr  1_mild_npdr  2_moderate_npdr  3_severe_npdr  4_proliferative_dr
+    # (readable names like "Mild"/"Moderate"/"No DR" sort in the WRONG order.) The active
+    # class for concept discovery is set by select_class(name); class_index is its position
+    # in that sorted list.
+    "data_root": os.path.join(CACHE_DIR, "dr_grading_imagefolder"),  # <split>/<grade>/*.jpg
     "train_dir": "train",
     "val_dir": "val",
     "test_dir": "test",
-    "class_name": "Diabetes",      # default showcase class (resolved by select_class; the
-    "class_index": None,           # fundus analogue of the old "tabby cat" default)
+    "class_name": "2_moderate_npdr",  # default showcase grade (resolved by select_class)
+    "class_index": None,
     # KNOB: max images per class drawn from the train split to train/fine-tune the backbone
-    # classifier. ODIR-5K is far smaller than the old 50k set, so most classes have well
-    # under this cap and are used in full; lower it only for a quick smoke run.
+    # classifier; lower it only for a quick smoke run.
     "n_per_class": 2000,
     "n_train": 100,                # images/class (train split) used to fit the concept basis W
     "n_val": 50,                   # images/class (val split) used for inference + metrics
+    # Evaluation normally uses only val images the backbone diagnoses correctly. For a scarce
+    # grade whose weak head gets fewer than this many right (e.g. Mild NPDR, ~4 val images),
+    # fall back to ALL val images so the grade still produces metrics instead of being skipped
+    # — reconstruction faithfulness then leans on prediction agreement (label-independent).
+    "min_eval_images": 5,
     "seed": 0,
 
     # --- backbone (encoder f + classifier head g) -----------------------------
-    # The classifier LGMD explains. DenseNet-121 fine-tuned to a num_classes-way fundus
-    # head (see train_backbone.py); weights loaded from backbone_weights. Reference setup
-    # reaches ~0.755 balanced accuracy on the 5-class ODIR-5K split. Other registered
-    # backbones (resnet34/50, mobilenet_v2) still work via model_utils._BACKBONES.
-    "backbone": "densenet121",     # "densenet121" | "resnet34" | "resnet50" | "mobilenet_v2"
-    "num_classes": 5,              # ODIR-5K classes N/D/G/C/A (resolved/checked against the folders)
-    "feat_dim": 1024,              # p — encoder channels (densenet121 = 1024)
-    "backbone_weights": os.path.join(CACHE_DIR, "densenet121_odir.pt"),  # trained 5-way weights
+    # The classifier LGMD explains. Default: RETFound (DINOv2 ViT-L/14) used as a FROZEN
+    # foundation encoder with a linear DR-grading head probed on top (train_backbone.py).
+    # The encoder is NOT fine-tuned — only the Linear(1024 -> num_classes) head is trained,
+    # and backbone_weights stores just that head. The torchvision conv backbones
+    # (densenet121/resnet34/resnet50/mobilenet_v2) still work via model_utils._BACKBONES.
+    "backbone": "retfound_dinov2", # "retfound_dinov2" | "densenet121" | "resnet34" | "resnet50" | "mobilenet_v2"
+    "num_classes": 5,              # 5 DR severity grades (checked against the folders)
+    "feat_dim": 1024,              # p — encoder channels (ViT-L / densenet121 both = 1024)
+    "backbone_weights": os.path.join(CACHE_DIR, "retfound_dinov2_head_dr.pt"),  # trained linear head only
+    # RETFound (DINOv2) foundation encoder: architecture fetched from torch.hub
+    # (facebookresearch/dinov2); SSL weights loaded from retfound_weights. Switch
+    # retfound_arch to 'dinov2_vitl14_reg' if your checkpoint is the register-token variant.
+    "retfound_arch": "dinov2_vitl14",
+    "retfound_img_size": 224,      # 224/14 = 16x16 native token grid (pooled to CONFIG['grid'])
+    "retfound_weights": os.path.join(CACHE_DIR, "retfound_dinov2_cfp.pth"),  # RETFound SSL encoder ckpt
     # Backbone preprocessing: "clip_shared_224" shares CLIP's exact 224 crop so encoder
     # feature cells and CLIP red-circle cells cover identical pixels (aligns A_bar <-> S).
     # Part of the activation cache key so changing it recomputes activations.
     "backbone_preprocess": "clip_shared_224",
-    "grid": 7,                     # h = w — encoder / CLIP probing grid, 7x7 (suppl. A1.6)
+    "grid": 8,                     # h = w — encoder / CLIP probing grid. 8x8 = exact 2x2 pool of
+                                   # DINOv2's 16x16 token grid (conv backbones used 7x7; A1.6).
 
     # --- backbone training (train_backbone.py) --------------------------------
     "train_epochs": 15,            # fine-tuning epochs on the n_per_class subset
@@ -139,14 +154,13 @@ CONFIG = {
     "train_batch_size": 64,
     "train_weight_decay": 1e-4,
 
-    # --- CLIP (localized similarity maps) -------------------------------------
-    # Default backend is BiomedCLIP (medical image-text), loaded via open_clip; set
-    # clip_backend="openai" to fall back to generic CLIP ViT-B/16 for comparison.
-    "clip_backend": "biomedclip",  # "biomedclip" | "openai"
-    "clip_model": "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224",  # open_clip id
-    "clip_model_openai": "openai/clip-vit-base-patch16",  # fallback HF CLIP ViT-B/16
+    # --- FLAIR VLM (localized similarity maps) --------------------------------
+    # The image-text model behind the semantic maps S: FLAIR "A Foundation
+    # LAnguage-Image model of the Retina" (github.com/jusiro/FLAIR), a CLIP trained on
+    # fundus images, so its image-text space is domain-matched to retinal pathology.
+    "flair_weights": None,         # FLAIR checkpoint path; None -> download pretrained weights
     "prompt_template": "a fundus photograph showing {}",  # medical text prompt for concepts
-    "circle_radius": 16,           # [suppl] red-circle radius (px) — suppl. A1.6 fixes a radius but gives no value
+    "circle_radius": 14,           # [suppl] red-circle radius (px) — sized to the 8x8 grid cell (224/8=28px)
     "circle_width": 3,             # [suppl] red-circle stroke width (px) — "thin" outline, value unspecified
     "circle_color": "red",         # red localization marker (suppl. A1.6)
 
@@ -157,7 +171,12 @@ CONFIG = {
     # "per_class": paper-faithful — each class draws its own r concepts from a
     #   class-keyed vocab via the two-stage lexical+CLIP filter (see concept_vocab.per_class.json).
     "concept_mode": "per_class",
-    "r": 25,                       # per_class only: concepts per class (paper fixes r = 25)
+    # per_class + concept_curated: use each grade's hand-curated concept list verbatim
+    # (variable count = however many are listed; no lexical/CLIP filtering, no fixed-r skip).
+    # Suits the grouped per-grade concept_vocab.json. Set False to run the paper's two-stage
+    # lexical+CLIP filter down to exactly `r` concepts instead.
+    "concept_curated": True,
+    "r": 25,                       # per_class + non-curated: concepts per class (paper fixes r = 25)
     # per_class only: if fewer than r concepts survive filtering, skip the class (raise
     # InsufficientConcepts so a multi-class run records it and continues) instead of
     # proceeding with a short basis. Recover via concepts.add_concepts + re-evaluate.
@@ -169,7 +188,9 @@ CONFIG = {
     "concept_filler_terms": _FILLER_TERMS,        # generic filler removed, rule i (suppl. A1.3)
     "concept_attribute_terms": _ATTRIBUTE_TERMS,  # attribute words exempt from class-name overlap (suppl. A1.3)
     "concept_proto_images": 100,   # up to N class images for CLIP relevance ranking (suppl. A1.4)
-    "dedup_threshold": 0.95,       # CLIP-text cosine sim above which concepts are near-dups (suppl. A1.4)
+    "dedup_threshold": 1.0,        # CLIP-text cosine sim above which concepts are near-dups.
+                                   # 1.0 = disabled: no concept is ever dropped as a near-dup
+                                   # (all pass). Only used in non-curated per_class mode.
 
     # --- optimization ---------------------------------------------------------
     # NOTE: PGD step sizes are NOT free params — the paper fixes them via the spectral
@@ -193,7 +214,7 @@ CONFIG = {
     # figure filename (so new figures never overwrite an old run's). Bump this string to
     # force a clean run without hand-deleting caches. The trained backbone weights are a
     # fixed path (not cache-keyed), so changing run_tag never triggers a retrain.
-    "run_tag": "diabetes_run2",
+    "run_tag": "dr_grading_run1",
 
     # --- paths ----------------------------------------------------------------
     "cache_dir": CACHE_DIR,
@@ -207,15 +228,18 @@ CONFIG = {
 # caches. Call sites name the dependency groups (see below) that apply.
 _CACHE_DEPS = {
     "data":  ["class_index", "class_name", "n_train", "n_val", "seed"],          # which images
-    "model": ["backbone", "backbone_preprocess", "num_classes", "backbone_weights"],  # encoder + head
-    "con":   ["concept_vocab_hash", "concept_mode", "concept_filler_terms",      # concept vocab
-              "concept_attribute_terms", "concept_word_min", "concept_word_max",
+    "model": ["backbone", "backbone_preprocess", "num_classes", "backbone_weights",   # encoder + head
+              "retfound_arch", "retfound_weights"],
+    "con":   ["concept_vocab_hash", "concept_mode", "concept_curated",            # concept vocab
+              "concept_filler_terms", "concept_attribute_terms",
+              "concept_word_min", "concept_word_max",
               "concept_proto_images", "dedup_threshold", "r", "class_name",
-              "clip_backend", "clip_model"],
-    "clip":  ["clip_backend", "clip_model", "prompt_template", "circle_radius",  # CLIP maps S
+              "flair_weights"],
+    "clip":  ["flair_weights",                                                   # VLM maps S
+              "prompt_template", "circle_radius",
               "circle_width", "circle_color", "grid"],
     "pgd":   ["pgd_iters"],                                                    # basis W fit
-    "infer": ["infer_iters"],                                                  # inference
+    "infer": ["infer_iters", "min_eval_images"],                              # inference + eval set
     "base":  ["craft_levels", "face_lambda", "face_iters", "face_lr"],         # baselines
     "cins":  ["cins_metric"],                                                  # C-Ins metric
 }
@@ -270,7 +294,7 @@ def get_secret(name):
 # ---------------------------------------------------------------------------
 # Fundus class registry (resolved from the dataset's own folders)
 # ---------------------------------------------------------------------------
-# The 7 disease classes are the sub-directories of <data_root>/<train_dir>. We read
+# The 5 DR-grade classes are the sub-directories of <data_root>/<train_dir>. We read
 # them straight off disk rather than hardcoding, so the class list and index ordering
 # can never drift from the dataset (and match torchvision ImageFolder, which sorts the
 # class folders alphabetically — that ordering is what the trained classifier predicts).
@@ -283,28 +307,27 @@ def _canon(name):
     return re.sub(r"[\s\-]+", "_", name.strip().lower())
 
 
-# Dataset folders don't always match the concept_vocab.json keys verbatim — AMD and the
-# normal class are the usual offenders (e.g. a folder named "AMD" or "Age related Macular
-# Degeneration" vs. the key "amd"; "Normal" vs. "normal_fundus"). Map any such folder name
-# to its vocab key here; both sides are compared canonically (snake_case). Extend this if
-# fundus_class_names() shows a folder whose name doesn't canonically equal its vocab key.
+# The canonical convention (folder name == concept_vocab.json key) is the numeric-prefixed
+# grade name, e.g. "2_moderate_npdr" — with that, resolve_vocab_key matches directly and no
+# alias is needed. This table only exists so alternative folder spellings still resolve:
+# bare numeric folders ("0".."4"), short forms ("mild", "pdr"), or a "Proliferative DR
+# (PDR)" folder whose parentheses survive canonicalization. Both sides are compared
+# canonically (snake_case); each value must be an actual key in concept_vocab.json.
 CONCEPT_ALIASES = {
-    # AMD variants -> "amd"
-    "amd": "amd",
-    "armd": "amd",
-    "age_related_macular_degeneration": "amd",
-    "age_related_macular_degeneration_amd": "amd",
-    "macular_degeneration": "amd",
-    # normal / healthy variants -> "normal_fundus"
-    "normal": "normal_fundus",
-    "normal_fundus": "normal_fundus",
-    "healthy": "normal_fundus",
-    "no_disease": "normal_fundus",
-    # diabetic-retinopathy variants -> "diabetic_retinopathy" (ODIR labels this "Diabetes")
-    "diabetes": "diabetic_retinopathy",
-    "diabetic": "diabetic_retinopathy",
-    "diabetic_retinopathy": "diabetic_retinopathy",
-    "dr": "diabetic_retinopathy",
+    # grade 0 — No DR
+    "0": "0_no_dr", "no_dr": "0_no_dr", "nodr": "0_no_dr", "normal": "0_no_dr", "no_dr_grade": "0_no_dr",
+    # grade 1 — Mild NPDR
+    "1": "1_mild_npdr", "mild": "1_mild_npdr", "mild_npdr": "1_mild_npdr", "mild_dr": "1_mild_npdr",
+    # grade 2 — Moderate NPDR
+    "2": "2_moderate_npdr", "moderate": "2_moderate_npdr", "moderate_npdr": "2_moderate_npdr",
+    "moderate_dr": "2_moderate_npdr",
+    # grade 3 — Severe NPDR
+    "3": "3_severe_npdr", "severe": "3_severe_npdr", "severe_npdr": "3_severe_npdr",
+    "severe_dr": "3_severe_npdr",
+    # grade 4 — Proliferative DR
+    "4": "4_proliferative_dr", "pdr": "4_proliferative_dr", "proliferative_dr": "4_proliferative_dr",
+    "proliferative": "4_proliferative_dr", "proliferative_dr_pdr": "4_proliferative_dr",
+    "proliferative_dr_(pdr)": "4_proliferative_dr",
 }
 
 
@@ -314,7 +337,13 @@ def resolve_vocab_key(class_name, available_keys):
     Tries an exact canonical match first, then the CONCEPT_ALIASES table. Returns the
     matching key from `available_keys`, or None if nothing matches.
     """
-    by_canon = {_canon(k): k for k in available_keys}
+    by_canon = {}
+    for k in available_keys:
+        ck_k = _canon(k)
+        by_canon.setdefault(ck_k, k)
+        # tolerate a leading "class_"/"grade_" prefix on the vocab key, so a key like
+        # "class_0_no_dr" is reachable from the folder "0_no_dr".
+        by_canon.setdefault(re.sub(r"^(class|grade)_", "", ck_k), k)
     ck = _canon(class_name)
     if ck in by_canon:
         return by_canon[ck]
@@ -346,9 +375,9 @@ def fundus_class_names(refresh=False):
 
 
 # Qualitative concept overlays are saved only for these classes (the figure subset) —
-# the fundus analogue of the paper's showcase rows. Matched canonically against the
-# actual folder names, so case/spacing need not be exact ("cataract" ~ "Cataract").
-FIGURE_CLASSES = ["Diabetes"]
+# the showcase grades. Matched canonically against the actual folder names, so case/
+# spacing need not be exact. These must be real folder names (not vocab aliases).
+FIGURE_CLASSES = ["2_moderate_npdr", "3_severe_npdr", "4_proliferative_dr"]
 
 
 def select_class(name):

@@ -45,12 +45,36 @@ def _canonical_key(name):
     return re.sub(r"[\s\-]+", "_", name.strip().lower())
 
 
+def _flatten_concepts(entry):
+    """Lowercased, de-duplicated concept labels from one vocab entry (order preserved).
+
+    Supports both vocab-entry shapes:
+      - a flat list: ["dot hemorrhage", {"label": "..."}, ...]
+      - a grouped dict: {"description": <str>, "<category>": [concepts...], "notes": {...}}
+        -> every LIST-valued field is a concept group; non-list fields (the description
+           text, a notes dict) are metadata and skipped.
+    """
+    groups = entry.values() if isinstance(entry, dict) else [entry]
+    out, seen = [], set()
+    for group in groups:
+        if not isinstance(group, (list, tuple)):
+            continue                                  # skip description / notes metadata
+        for c in group:
+            label = (c["label"] if isinstance(c, dict) else c)
+            label = str(label).strip().lower()
+            if label and label not in seen:
+                seen.add(label)
+                out.append(label)
+    return out
+
+
 def _load_vocab(cls):
     """Load the stored candidate concepts for `cls` (lowercased strings).
 
     The vocab table is keyed by snake_case identifiers, but `cls` is typically the
-    human-readable class name (e.g. 'tabby cat'); we match by canonical key so
-    either form resolves.
+    human-readable class name (e.g. 'Moderate NPDR'); we match by canonical key so
+    either form resolves. Each entry may be a flat list or a grouped dict (see
+    _flatten_concepts).
     """
     path = CONFIG["concept_vocab_path"]
     if not os.path.exists(path):
@@ -64,15 +88,11 @@ def _load_vocab(cls):
     if key is None:
         raise KeyError(
             f"No concept vocabulary for class '{cls}' in {path}. Available keys: "
-            f"{sorted(table)}. If the folder name differs from its key (e.g. AMD / "
-            f"normal variants), add it to CONCEPT_ALIASES in config.py."
+            f"{sorted(table)}. If the folder name differs from its key (e.g. a bare "
+            f"'2' or 'Moderate NPDR' folder vs. key '2_moderate_npdr'), add it to "
+            f"CONCEPT_ALIASES in config.py."
         )
-    raw = []
-    for c in table[key]:
-        label = (c["label"] if isinstance(c, dict) else c).strip().lower()
-        if label:
-            raw.append(label)
-    return raw
+    return _flatten_concepts(table[key])
 
 
 def _lexical_filter(concepts, cls):
@@ -104,7 +124,7 @@ def _lexical_filter(concepts, cls):
     return kept
 
 
-def _clip_select(concepts, clip, images, threshold, r):
+def _clip_select(concepts, vlm, images, threshold, r):
     """Stage-2 CLIP semantic filter (suppl. A1.4).
 
     Rank concepts by cosine similarity to the mean CLIP embedding of up to
@@ -116,13 +136,13 @@ def _clip_select(concepts, clip, images, threshold, r):
     if not concepts:
         return []
     prompts = [CONFIG["prompt_template"].format(c) for c in concepts]
-    text_emb = clip.embed_text(prompts)                 # (n, d), L2-normalized
+    text_emb = vlm.embed_text(prompts)                  # (n, d), L2-normalized
 
     order = list(range(len(concepts)))
     if images:
         from data_utils import clip_preprocess       # lazy: avoids torch import when unused
         sample = images[:CONFIG["concept_proto_images"]]
-        proto = clip.embed_images([clip_preprocess(im) for im in sample]).mean(0)
+        proto = vlm.embed_images([clip_preprocess(im) for im in sample]).mean(0)
         proto = proto / proto.norm()                    # class image prototype mu_I
         scores = text_emb @ proto                       # s_i = <t_i, mu_I>
         order.sort(key=lambda i: float(scores[i]), reverse=True)
@@ -158,17 +178,16 @@ def _shared_bank():
     with open(path) as f:
         table = json.load(f)
     bank, seen = [], set()
-    values = table.values() if isinstance(table, dict) else [table]
-    for group in values:
-        for c in group:
-            label = (c["label"] if isinstance(c, dict) else c).strip().lower()
-            if label and label not in seen:
+    entries = table.values() if isinstance(table, dict) else [table]
+    for entry in entries:                                # each entry: flat list or grouped dict
+        for label in _flatten_concepts(entry):
+            if label not in seen:
                 seen.add(label)
                 bank.append(label)
     return bank
 
 
-def get_concepts(clip, images=None):
+def get_concepts(vlm, images=None):
     """Return the concept list for the target class, cached to JSON.
 
     In "shared" mode (default) returns the fixed shared bank — same for every class.
@@ -190,9 +209,27 @@ def get_concepts(clip, images=None):
         return concepts
 
     cls, r = CONFIG["class_name"], CONFIG["r"]
-    raw = _load_vocab(cls)                                  # stored vocabulary (over-provided)
+    raw = _load_vocab(cls)                                  # stored vocabulary
+
+    if CONFIG.get("concept_curated", False):
+        # Hand-curated per-grade list: use verbatim (variable r = #concepts listed), with no
+        # lexical/CLIP filtering and no fixed-r skip. Basis columns = this grade's concepts.
+        concepts = list(dict.fromkeys(raw))
+        if not concepts:
+            raise InsufficientConcepts(
+                f"No concepts listed for '{cls}' in {CONFIG['concept_vocab_path']}. Add "
+                f"candidates for it (e.g. concepts.add_concepts('{cls}', [...])).")
+        if len(concepts) < 5:
+            print(f"[warn] only {len(concepts)} concepts for '{cls}' — the concept basis "
+                  f"will be very thin (reconstruction / C-Insertion may be degenerate); "
+                  f"consider adding a few more.")
+        with open(path, "w") as f:
+            json.dump(concepts, f, indent=2)
+        print(f"[cache] saved concepts.json ({len(concepts)} curated concepts for '{cls}')")
+        return concepts
+
     lexical = _lexical_filter(raw, cls)                     # stage 1 (suppl. A1.3)
-    concepts = _clip_select(lexical, clip, images,         # stage 2 (suppl. A1.4)
+    concepts = _clip_select(lexical, vlm, images,          # stage 2 (suppl. A1.4)
                             CONFIG["dedup_threshold"], r)
     if not concepts or len(concepts) < r:
         short = len(concepts)
@@ -233,17 +270,22 @@ def add_concepts(cls, new_concepts, vocab_path=None):
         table = json.load(f)
 
     key = resolve_vocab_key(cls, table.keys()) or _canonical_key(cls)
-    existing = list(table.get(key, []))
-    seen = {(c["label"] if isinstance(c, dict) else c).strip().lower() for c in existing}
+    entry = table.get(key, [])
+    seen = set(_flatten_concepts(entry))
 
     added = []
     for c in new_concepts:
         label = (c["label"] if isinstance(c, dict) else c).strip().lower()
         if label and label not in seen:
             seen.add(label)
-            existing.append(label)
             added.append(label)
-    table[key] = existing
+    # Grouped-dict entry: append to an "added" concept group (flattened back out on load);
+    # flat-list entry: extend the list. Either way _flatten_concepts picks the new concepts up.
+    if isinstance(entry, dict):
+        entry.setdefault("added", []).extend(added)
+    else:
+        entry = list(entry) + added
+    table[key] = entry
 
     with open(path, "wb") as f:
         blob = json.dumps(table, indent=2, ensure_ascii=False).encode()

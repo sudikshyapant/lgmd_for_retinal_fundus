@@ -70,18 +70,16 @@ _init_style()
 
 # --- shared helpers --------------------------------------------------------
 _PRETTY_CLASS = {
-    "diabetes": "Diabetic Retinopathy",
-    "diabetic_retinopathy": "Diabetic Retinopathy",
-    "amd": "AMD",
-    "normal": "Normal",
-    "normal_fundus": "Normal",
-    "cataract": "Cataract",
-    "glaucoma": "Glaucoma",
+    "0_no_dr": "No DR",
+    "1_mild_npdr": "Mild NPDR",
+    "2_moderate_npdr": "Moderate NPDR",
+    "3_severe_npdr": "Severe NPDR",
+    "4_proliferative_dr": "Proliferative DR",
 }
 
 
 def _pretty_class(name):
-    """Dataset folder name -> clean clinical display label (e.g. 'Diabetes' -> 'Diabetic Retinopathy')."""
+    """Dataset folder name -> clean clinical display label (e.g. '2_moderate_npdr' -> 'Moderate NPDR')."""
     key = re.sub(r"[\s\-]+", "_", str(name).strip().lower())
     return _PRETTY_CLASS.get(key, str(name).replace("_", " ").title())
 
@@ -152,6 +150,27 @@ def _style_table(tbl, n_header):
         if c == 0 and r > 0:                         # row label column
             cell.set_text_props(fontweight="semibold")
     tbl.auto_set_column_width(range(n_header))
+
+
+def _emphasize_cells(tbl, emphasis):
+    """Mark best / second-best table cells without mathtext (which lacks \\underline).
+
+    `emphasis` maps (row, col) table-cell keys to a rank: 0 = best (bold), 1 =
+    second-best (italic). Applied to the real Text objects so it renders on any
+    backend, unlike the old ``$\\mathbf{}$`` / ``$\\underline{}$`` cell strings that
+    crashed matplotlib's built-in mathtext parser on ``\\underline`` (which it does
+    not support). Italic stands in for the paper's underline, which matplotlib Text
+    cannot render without a full LaTeX install.
+    """
+    for (r, c), rank in emphasis.items():
+        cell = tbl.get_celld().get((r, c))
+        if cell is None:
+            continue
+        if rank == 0:
+            cell.get_text().set_fontweight("bold")
+        elif rank == 1:
+            cell.get_text().set_fontstyle("italic")
+            cell.get_text().set_fontweight("semibold")
 
 
 def save_concept_overlays(images, S_hat, concepts, out_name="overlays.png", max_images=4):
@@ -379,14 +398,72 @@ def plot_concept_patches(images, S, concepts=None, top_concepts=3, n_patches=3,
     return _save(fig, out_name)
 
 
+def plot_concept_grounding(grounding, out_name="fig_concept_grounding.png",
+                           score="peak", show_mean=True):
+    """Sorted per-grade bar chart of FLAIR concept grounding (bars colored by score).
+
+    `grounding` is {grade: {concept: {"peak": float, "mean": float}}} from
+    runner.grounding_table. Each grade is a panel sized to its concept count; concepts are
+    sorted by `score` (most-grounded at top) and bars are colored by that score (shared
+    viridis scale) so the figure doubles as a heatmap. With show_mean, the diffuse mean is
+    overlaid as a red marker for comparison against the localized peak.
+    """
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import Normalize
+
+    _init_style()
+    grades = [g for g in grounding if grounding[g]]
+    if not grades:
+        print("[viz] no grounding data to plot.")
+        return None
+    counts = [len(grounding[g]) for g in grades]
+    vmax = max((d[score] for g in grades for d in grounding[g].values()), default=1.0) or 1.0
+    norm, cmap = Normalize(0.0, vmax), plt.get_cmap(HEAT_CMAP)
+
+    fig, axes = plt.subplots(
+        len(grades), 1, squeeze=False,
+        figsize=(8.5, 0.30 * sum(counts) + 0.95 * len(grades) + 0.6),
+        gridspec_kw={"height_ratios": counts},
+    )
+    axes = axes[:, 0]
+    for ax, g in zip(axes, grades):
+        items = sorted(grounding[g].items(), key=lambda kv: kv[1][score])  # asc -> peak on top
+        labels = [c for c, _ in items]
+        vals = [d[score] for _, d in items]
+        y = list(range(len(items)))
+        ax.barh(y, vals, color=[cmap(norm(v)) for v in vals],
+                edgecolor="white", linewidth=0.5, height=0.8, zorder=2)
+        if show_mean and score == "peak":
+            ax.scatter([d["mean"] for _, d in items], y, s=12, color=CONTOUR_COLOR,
+                       zorder=3, label="mean")
+        for yi, v in zip(y, vals):
+            ax.text(v + vmax * 0.012, yi, f"{v:.2f}", va="center", ha="left",
+                    fontsize=FS_TICK - 1, color="#333333")
+        ax.set_yticks(y)
+        ax.set_yticklabels(labels, fontsize=FS_CONCEPT)
+        ax.set_ylim(-0.6, len(items) - 0.4)
+        ax.set_xlim(0, vmax * 1.14)
+        ax.set_title(_pretty_class(g), fontsize=FS_TITLE, loc="left")
+        ax.tick_params(axis="x", labelsize=FS_TICK)
+        for s in ("top", "right"):
+            ax.spines[s].set_visible(False)
+    axes[-1].set_xlabel(f"FLAIR grounding ({score})", fontsize=FS_LABEL)
+    if show_mean and score == "peak":
+        axes[0].legend(loc="lower right", fontsize=FS_TICK, frameon=False)
+    sm = ScalarMappable(norm=norm, cmap=cmap)
+    sm.set_array([])
+    fig.colorbar(sm, ax=list(axes), fraction=0.02, pad=0.02, label=f"grounding {score}")
+    return _save(fig, out_name)
+
+
 def render_metric_table(table, out_name, methods=("OURS", "FACE", "ICE", "CRAFT"),
                         backbones=("ResNet", "MobileNet"), value_fmt="{:.2f}",
                         higher_is_better=True, title=None):
-    """Tables 1 & 2: per-category metric table with best bold / second-best underlined.
+    """Tables 1 & 2: per-category metric table with best bold / second-best italic.
 
     `table` is nested: table[backbone][category][method] = float. Rows are categories
     (plus an "Average" row if present); within each backbone block the best value in a
-    row is bolded and the second-best underlined (paper Tables 1-2 convention). Renders
+    row is bolded and the second-best italicized (paper Tables 1-2 convention). Renders
     a matplotlib table image; ties are broken by first occurrence.
     """
     cats = list(next(iter(table.values())).keys())
@@ -399,24 +476,17 @@ def render_metric_table(table, out_name, methods=("OURS", "FACE", "ICE", "CRAFT"
             order = order[::-1]
         return vals, {int(idx): pos for pos, idx in enumerate(order)}
 
-    def fmt_row(cat, bb):
-        vals, rank = _rank(cat, bb)
-        cells = []
-        for i, v in enumerate(vals):
-            s = value_fmt.format(v)
-            if rank.get(i) == 0:
-                s = r"$\mathbf{" + s + "}$"           # best -> bold
-            elif rank.get(i) == 1:
-                s = r"$\underline{" + s + "}$"        # second -> underlined
-            cells.append(s)
-        return cells
-
     col_labels = [f"{bb}:{m}" for bb in backbones for m in methods]
-    cell_text = []
-    for cat in cats:
+    cell_text, emphasis = [], {}
+    for r_data, cat in enumerate(cats):
         row = [_pretty_class(cat) if cat != "Average" else cat]
         for bb in backbones:
-            row += fmt_row(cat, bb)
+            vals, rank = _rank(cat, bb)
+            for i, v in enumerate(vals):
+                if rank.get(i) in (0, 1):
+                    # table cell key: header is row 0, so data rows start at 1
+                    emphasis[(r_data + 1, len(row))] = rank[i]
+                row.append(value_fmt.format(v))
         cell_text.append(row)
 
     # plain-text version to stdout (best marked '*', second-best '^')
@@ -448,6 +518,7 @@ def render_metric_table(table, out_name, methods=("OURS", "FACE", "ICE", "CRAFT"
     tbl.set_fontsize(FS_CONCEPT)
     tbl.scale(1, 1.5)
     _style_table(tbl, len(header))
+    _emphasize_cells(tbl, emphasis)
     return _save(fig, out_name)
 
 
@@ -455,11 +526,11 @@ def render_class_metric_table(class_name, comparison,
                               metrics=("Acc", "C-Ins", "agreement", "kl", "recon_err"),
                               methods=("LGMD", "FACE", "ICE", "CRAFT"),
                               higher_is_better=None, value_fmt="{:.3f}", out_name=None):
-    """One class's methods x metrics table (best per metric bold, second-best underlined).
+    """One class's methods x metrics table (best per metric bold, second-best italic).
 
     `comparison` is results[class]["comparison"] = {method: {metric: value}}. Rows are the
     methods, columns are every metric used. Within each metric column the best method is
-    bolded and the second-best underlined, using `higher_is_better[metric]` for the
+    bolded and the second-best italicized, using `higher_is_better[metric]` for the
     direction — Acc / C-Ins / agreement are up, kl / recon_err are down. An arrow after
     each header marks its direction. Renders + saves a styled table (and prints a
     plain-text version), mirroring render_metric_table.
@@ -479,19 +550,18 @@ def render_class_metric_table(class_name, comparison,
         return {int(idx): pos for pos, idx in enumerate(order)}
 
     ranks = {metric: rank(metric) for metric in metrics}
-    cell_text, text_rows = [], []
+    cell_text, text_rows, emphasis = [], [], {}
     for i, meth in enumerate(methods):
         row, trow = [meth], [meth]
-        for metric in metrics:
+        for j, metric in enumerate(metrics):
             v = comparison.get(meth, {}).get(metric, float("nan"))
             s = value_fmt.format(v)
             r = ranks[metric].get(i)
             mark = "*" if r == 0 else "^" if r == 1 else " "
             trow.append(s + mark)
-            if r == 0:
-                s = r"$\mathbf{" + s + "}$"           # best -> bold
-            elif r == 1:
-                s = r"$\underline{" + s + "}$"        # second -> underlined
+            if r in (0, 1):
+                # header is table row 0, so method rows start at 1; col 0 is the label
+                emphasis[(i + 1, j + 1)] = r
             row.append(s)
         cell_text.append(row)
         text_rows.append(trow)
@@ -516,6 +586,7 @@ def render_class_metric_table(class_name, comparison,
     tbl.set_fontsize(FS_CONCEPT)
     tbl.scale(1, 1.5)
     _style_table(tbl, len(header))
+    _emphasize_cells(tbl, emphasis)
     return _save(fig, out_name or f"table_{class_name.lower()}_metrics.png")
 
 

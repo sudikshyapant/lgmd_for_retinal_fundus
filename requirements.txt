@@ -1,7 +1,7 @@
 torch
 torchvision
 transformers
-open_clip_torch
+git+https://github.com/jusiro/FLAIR.git   # retinal FLAIR VLM (imports as `flair`); pulls transformers
 datasets
 scikit-learn
 numpy
