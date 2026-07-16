@@ -42,20 +42,19 @@ def mse(A, A_hat):
 
 
 @torch.no_grad()
-def faithfulness_curves(S_hat, W, shape, head_fn, label, metric=None):
-    """C-Deletion and C-Insertion curves over concepts, ordered by importance.
+def insertion_curve(S_hat, W, shape, head_fn, label, metric=None):
+    """C-Insertion curve over concepts, ordered by importance (paper §4.2).
 
-    Importance = total activation mass per concept. Deletion removes concepts most-
-    important-first (steep early drop = faithful); insertion adds them in the same
-    order (steep early rise = faithful).
+    Importance = total activation mass per concept. Concepts are added most-important-first
+    (steep early rise = faithful): starting from an empty coefficient matrix, we add one
+    concept at a time and record model performance.
 
     `metric` ("prob" | "accuracy", default CONFIG["cins_metric"]) selects how "model
     performance" is measured at each step: mean true-class probability, or accuracy.
     """
     n, p, h, w = shape
     metric = metric or CONFIG["cins_metric"]
-    importance = S_hat.sum(0)                           # (r,)
-    order = torch.argsort(importance, descending=True)
+    order = torch.argsort(S_hat.sum(0), descending=True)   # concept importance
 
     def true_prob(S):
         A_hat = (S @ W.T).reshape(n, h, w, p).permute(0, 3, 1, 2)
@@ -64,21 +63,12 @@ def faithfulness_curves(S_hat, W, shape, head_fn, label, metric=None):
             return float((logits.argmax(-1) == label).float().mean())
         return float(F.softmax(logits, -1)[:, label].mean())
 
-    # deletion: start full, zero out concepts one by one
-    deletion, S = [], S_hat.clone()
-    deletion.append(true_prob(S))
-    for k in order.tolist():
-        S[:, k] = 0
-        deletion.append(true_prob(S))
-
-    # insertion: start empty, add concepts most-important-first
-    insertion, S = [], torch.zeros_like(S_hat)
-    insertion.append(true_prob(S))
+    curve, S = [], torch.zeros_like(S_hat)
+    curve.append(true_prob(S))
     for k in order.tolist():
         S[:, k] = S_hat[:, k]
-        insertion.append(true_prob(S))
-
-    return {"deletion": deletion, "insertion": insertion}
+        curve.append(true_prob(S))
+    return curve
 
 
 def insertion_auc(curve):

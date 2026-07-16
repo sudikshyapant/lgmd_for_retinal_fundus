@@ -1,16 +1,15 @@
-"""Drive the LGMD pipeline across the 40-class ImageNet benchmark.
+"""Drive the LGMD pipeline across the 5 DR-severity grades.
 
 The backbone and VLM are class-independent, so they are loaded once and reused. For
-each class we select it (config.select_class sets class_name / synset / index), then run
+each grade we select it (config.select_class sets class_name / index), then run
 data -> activations -> concepts -> S -> W -> inference -> metrics + baselines. Every heavy
-artifact is cached per class via cache_name() (the "data"/"con" groups key on the active
-class). Qualitative overlays are produced only for FIGURE_CLASSES, mirroring the paper's
-figures (cat, bald eagle, library, electric guitar).
+artifact is cached per grade via cache_name() (the "data"/"con" groups key on the active
+grade). Qualitative overlays are produced only for FIGURE_CLASSES.
 
 Usage (from the notebook, after the sys.path setup cell):
     import runner
-    results, agg = runner.run_all()                 # all 40 classes
-    results, agg = runner.run_all(["tabby cat"])    # a subset
+    results, agg, failures = runner.run_all()                  # all grades
+    results, agg, failures = runner.run_all(["3_severe_npdr"]) # a subset
 """
 
 import os
@@ -135,11 +134,11 @@ def run_class(name, model, transform, vlm, make_figures=False):
             Sb = lgmd.infer(A_val, Wb)
             Ab = lgmd.reconstruct(Sb, Wb, Z_val.shape)
             lg = model_utils.logits_from_Z(model, Ab)
-            cur = metrics.faithfulness_curves(Sb, Wb, Z_val.shape, head_fn, label)
+            cur = metrics.insertion_curve(Sb, Wb, Z_val.shape, head_fn, label)
             pp = metrics.predictive_preservation(orig_logits, lg, label)
             out[bn] = {
                 "Acc": pp["recon_acc"],
-                "C-Ins": metrics.insertion_auc(cur["insertion"]),
+                "C-Ins": metrics.insertion_auc(cur),
                 "agreement": pp["agreement"],
                 "kl": metrics.kl_logits(orig_logits, lg),
                 "recon_err": metrics.recon_error(A_val, lgmd.unfold(Ab)),
@@ -263,12 +262,11 @@ def _grounding_for_class(name, vlm):
 def grounding_table(classes=None, print_table=True, save=True, plot=True, score="peak"):
     """Per-concept FLAIR visual-grounding table AND figure for each grade.
 
-    For every class, scores how visually grounded each concept is via FLAIR's localized
+    For every grade, scores how visually grounded each concept is via FLAIR's localized
     similarity maps S — peak (strongest localized cell, averaged over images) and mean
-    (diffuse presence). No concept is dropped; this captures grounding while (with
-    concept_curated) every concept still passes into the basis. Emits three artifacts:
-    a printed per-grade table, a saved JSON, and a sorted bar/heatmap figure (viz).
-    Returns {grade: {concept: {"peak": float, "mean": float}}}.
+    (diffuse presence). No concept is dropped; this is a diagnostic run alongside the basis
+    fit. Emits three artifacts: a printed per-grade table, a saved JSON, and a sorted
+    bar/heatmap figure (viz). Returns {grade: {concept: {"peak": float, "mean": float}}}.
     """
     classes = classes if classes is not None else fundus_class_names()
     vlm = flair_maps.VLM()
@@ -307,17 +305,16 @@ def _print_grounding(cls, rows):
 
 
 def run_all(classes=None, figure_classes=None):
-    """Run the pipeline over `classes` (default: every dataset class).
+    """Run the pipeline over `classes` (default: every DR grade).
 
     Returns (results, aggregate, failures): `failures` maps each skipped class name to its
     error string, printed as a numbered list so the recovery cell can reference a class by
     its number.
 
     Loads the backbone + VLM once and reuses them. Overlays are saved only for classes in
-    `figure_classes` (default: FIGURE_CLASSES). A class that errors out (e.g. too few val
-    images, or — in per_class mode — fewer than r concepts surviving filtering) is printed
-    and skipped rather than aborting the whole run; every other class still completes and is
-    cached, so a rerun resumes for free.
+    `figure_classes` (default: FIGURE_CLASSES). A grade that errors out (e.g. too few val
+    images, or no concepts listed for it) is printed and skipped rather than aborting the
+    whole run; every other grade still completes and is cached, so a rerun resumes for free.
     """
     classes = classes if classes is not None else fundus_class_names()
     # Figure overlays: explicit list, else FIGURE_CLASSES, else auto-pick the first class.

@@ -4,58 +4,29 @@ The predictor g(f(x)) is split into:
   - encoder f: image -> spatial feature map Z (n, p, h, w)
   - head    g: Z -> logits, via global average pooling + the classifier
 
-Default backbone is RETFound (DINOv2 ViT-L/14): a frozen foundation encoder whose
-patch tokens form the (n, p, grid, grid) map, with a linear DR-grading head on top
-(see retfound.py). The torchvision conv backbones (DenseNet-121, ResNet34/50,
-MobileNetV2) share the same abstraction, so the rest of the pipeline is backbone-agnostic.
+The backbone is RETFound (MAE ViT-L/16): a frozen foundation encoder whose patch tokens
+form the (n, p, grid, grid) map, with a linear DR-grading head on top (see retfound.py).
 """
 
 import torch
 import torch.nn.functional as F
-import torchvision
 from tqdm import tqdm
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ImageNet normalization stats (RETFound/DINOv2 preprocessing; the conv backbones read
-# theirs off the torchvision weights enum instead).
+# ImageNet normalization stats (RETFound/MAE preprocessing).
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)
 
-_BACKBONES = {
-    "densenet121":  (torchvision.models.densenet121,  torchvision.models.DenseNet121_Weights.IMAGENET1K_V1),
-    "resnet34":     (torchvision.models.resnet34,     torchvision.models.ResNet34_Weights.IMAGENET1K_V1),
-    "resnet50":     (torchvision.models.resnet50,     torchvision.models.ResNet50_Weights.IMAGENET1K_V2),
-    "mobilenet_v2": (torchvision.models.mobilenet_v2, torchvision.models.MobileNet_V2_Weights.IMAGENET1K_V2),
-}
-
-
-def _is_retfound(model):
-    import retfound
-    return isinstance(model, retfound._RETFoundBase)
-
-
-def _aligned_transform(weights):
-    """Backbone preprocessing that shares CLIP's exact 224 crop.
-
-    The encoder feature cell (i, j) and the CLIP red-circle cell (i, j) must cover the
-    same pixels, or the rows of A_bar and S (both unfolded row-major) describe slightly
-    different image regions and S picks up spatial slop. We reuse `clip_preprocess`
-    (resize shortest-side -> 224, center crop) for geometry, then apply ONLY the weights'
-    ToTensor + Normalize -- deliberately skipping the weights' own resize/crop, which
-    would re-zoom to the backbone's native (e.g. 256->224) field of view.
-    """
-    from torchvision.transforms import Compose, Normalize, ToTensor
-
-    from data_utils import clip_preprocess
-
-    base = weights.transforms()                          # exposes ImageNet mean/std
-    normalize = Compose([ToTensor(), Normalize(base.mean, base.std)])
-    return lambda img: normalize(clip_preprocess(img))
-
 
 def _retfound_transform():
-    """RETFound/DINOv2 preprocessing: CLIP-shared 224 crop + ImageNet ToTensor/Normalize."""
+    """RETFound preprocessing: FLAIR-shared 224 crop + ImageNet ToTensor/Normalize.
+
+    We reuse `clip_preprocess` (resize shortest-side -> 224, center crop) for geometry so
+    the encoder feature cell (i, j) and the FLAIR red-circle cell (i, j) cover the same
+    pixels — otherwise the rows of A_bar and S (both unfolded row-major) would describe
+    slightly different image regions.
+    """
     from torchvision.transforms import Compose, Normalize, ToTensor
 
     from data_utils import clip_preprocess
@@ -64,105 +35,55 @@ def _retfound_transform():
     return lambda img: normalize(clip_preprocess(img))
 
 
-def _replace_head(model, name, num_classes):
-    """Swap the pretrained 1000-way classifier for a `num_classes`-way fundus head."""
-    import torch.nn as nn
-    if name.startswith("resnet"):
-        model.fc = nn.Linear(model.fc.in_features, num_classes)
-    elif name.startswith("densenet"):
-        model.classifier = nn.Linear(model.classifier.in_features, num_classes)
-    elif name == "mobilenet_v2":
-        model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, num_classes)
-    else:
-        raise ValueError(f"unknown backbone {name!r}")
-    return model
+def build_backbone(pretrained=True):
+    """Construct the RETFound MAE backbone with a fresh `num_classes`-way head.
 
-
-def build_backbone(name=None, pretrained=True):
-    """Construct the backbone architecture with a fresh `num_classes`-way head.
-
-    `pretrained=True` initializes from ImageNet weights (used by train_backbone.py to
-    fine-tune); `pretrained=False` gives a bare architecture (used when loading our own
-    trained weights). Returns (model_on_DEVICE, CLIP-aligned transform).
+    The RETFound SSL encoder is always loaded (it *is* the foundation model); `pretrained`
+    is accepted for call-site symmetry but does not gate the encoder load. Returns
+    (model_on_DEVICE, FLAIR-aligned transform).
     """
+    import retfound
     from config import CONFIG
-    name = name or CONFIG["backbone"]
-    if name.startswith("retfound"):
-        import retfound
-        # The RETFound SSL encoder is always loaded (it *is* the foundation model); the
-        # `pretrained` flag only governs torchvision ImageNet inits, which don't apply here.
-        model = retfound.build(CONFIG["num_classes"], load_pretrained=True)
-        return model.to(DEVICE), _retfound_transform()
-    ctor, weights = _BACKBONES[name]
-    model = ctor(weights=weights if pretrained else None)
-    _replace_head(model, name, CONFIG["num_classes"])
-    return model.to(DEVICE), _aligned_transform(weights)
+    model = retfound.build(CONFIG["num_classes"], load_pretrained=True)
+    return model.to(DEVICE), _retfound_transform()
 
 
-def load_backbone(name=None):
-    """Load the fundus-trained backbone (num_classes-way head) for the LGMD pipeline.
+def load_backbone():
+    """Load the DR-trained backbone (num_classes-way head) for the LGMD pipeline.
 
-    Reads weights from CONFIG['backbone_weights'] — the file produced by
+    Reads the trained head from CONFIG['backbone_weights'] — the file produced by
     train_backbone.py. Raises a clear error if those weights don't exist yet.
     """
     import os
     import torch
     from config import CONFIG
-    name = name or CONFIG["backbone"]
     wpath = CONFIG["backbone_weights"]
     if not os.path.exists(wpath):
         raise FileNotFoundError(
             f"Trained backbone weights not found at {wpath}. Run train_backbone.train() "
-            f"first to fine-tune the backbone on the fundus dataset."
+            f"first to linear-probe the head on the fundus dataset."
         )
-    model, transform = build_backbone(name, pretrained=False)
+    model, transform = build_backbone(pretrained=False)
     state = torch.load(wpath, map_location=DEVICE)
-    if name.startswith("retfound"):
-        model.head.load_state_dict(state)   # linear probe: only the head was trained/saved
-    else:
-        model.load_state_dict(state)
+    model.head.load_state_dict(state)   # linear probe: only the head was trained/saved
     return model.eval(), transform
 
 
-def _is_mobilenet(model):
-    return isinstance(model, torchvision.models.MobileNetV2)
-
-
-def _is_densenet(model):
-    return isinstance(model, torchvision.models.DenseNet)
-
-
 def encoder(model, x):
-    """f: input images -> spatial feature map Z (n, p, h, w)."""
-    if _is_retfound(model):
-        return model.feature_map(x)                      # (n, 1024, grid, grid)
-    if _is_mobilenet(model):
-        return model.features(x)                         # (n, 1280, 7, 7)
-    if _is_densenet(model):
-        # DenseNet's forward applies a final ReLU between features and pooling, so we
-        # fold it into the encoder — then head() = GAP + classifier reproduces model(x)
-        # exactly (and the feature map is the non-negative post-ReLU activation).
-        return F.relu(model.features(x), inplace=False)  # (n, 1024, 7, 7)
-    # ResNet family
-    x = model.conv1(x); x = model.bn1(x); x = model.relu(x); x = model.maxpool(x)
-    x = model.layer1(x); x = model.layer2(x); x = model.layer3(x); x = model.layer4(x)
-    return x                                              # (n, 512|2048, 7, 7)
+    """f: input images -> spatial feature map Z (n, p, grid, grid)."""
+    return model.feature_map(x)
 
 
 def classify_pooled(model, a):
     """g restricted to its final layer: globally-pooled features a (n, p) -> logits.
 
-    Grad-enabled and architecture-aware (used directly, and by FACE's KL term).
+    Grad-enabled (used directly, and by FACE's KL term).
     """
-    if _is_retfound(model):
-        return model.classify(a)
-    if _is_mobilenet(model) or _is_densenet(model):
-        return model.classifier(a)
-    return model.fc(a)
+    return model.classify(a)
 
 
 def head(model, z):
-    """g: spatial feature map -> logits, via GAP + the pretrained classifier."""
+    """g: spatial feature map -> logits, via GAP + the linear classifier."""
     a = torch.flatten(F.adaptive_avg_pool2d(z, 1), 1)    # global average pooling
     return classify_pooled(model, a)
 

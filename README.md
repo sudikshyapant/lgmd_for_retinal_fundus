@@ -1,10 +1,14 @@
 # Concept Discovery on Retinal Fundus Images (LGMD)
 
 Post-hoc concept discovery for a **5-grade diabetic-retinopathy classifier**. **RETFound
-(DINOv2 ViT-L/14)** — a retinal foundation model — is used as a **frozen** encoder with a
+(MAE ViT-L/16)** — a retinal foundation model — is used as a **frozen** encoder with a
 **linear DR-grading head** on top, and that classifier is explained with **named clinical
 concepts** via CLIP-guided matrix decomposition (`Ā ≈ S Wᵀ`), using **FLAIR** (a foundation
 language-image model of the retina) for the concept maps `S`.
+
+Two model roles are kept separate, mirroring the LGMD paper: the **classifier** being
+explained (RETFound MAE, replacing the paper's conv nets) and the **VLM** that grounds
+concepts (FLAIR, replacing the paper's CLIP).
 
 ## Data
 
@@ -43,11 +47,10 @@ it still produces metrics instead of being skipped.
 
 ## RETFound checkpoint
 
-The DINOv2 architecture is fetched from `torch.hub` (`facebookresearch/dinov2`), but the
+The RETFound (MAE ViT-L/16) architecture is built via `timm` (`vit_large_patch16_224`); the
 RETFound pretrained **encoder** weights are not public here — download them and place the file
-at `CONFIG["retfound_weights"]` (default `cache/retfound_dinov2_cfp.pth`). Use
-`CONFIG["retfound_arch"] = "dinov2_vitl14_reg"` if your checkpoint is the register-token
-variant. Only the linear head is trained; it is saved separately to `CONFIG["backbone_weights"]`.
+at `CONFIG["retfound_weights"]` (default `cache/RETFound_mae_natureCFP.pth`). Only the linear
+head is trained; it is saved separately to `CONFIG["backbone_weights"]`.
 
 ## Run (notebook, after the `sys.path` cell that adds `src/`)
 
@@ -60,7 +63,7 @@ dr_prep.prepare()                            # sets CONFIG["data_root"]
 config.fundus_class_names(refresh=True)      # confirm the 5 grade-folder names
 
 import train_backbone
-train_backbone.train()          # linear-probe the head -> cache/retfound_dinov2_head_dr.pt
+train_backbone.train()          # linear-probe the head -> cache/retfound_mae_head_dr.pt
 
 import runner
 results, agg, failures = runner.run_all()                 # all grades (cached, fault-tolerant)
@@ -105,23 +108,20 @@ rate. The Kaggle slug is `lesion_eval.IDRID_SLUG` (override with `run_localizati
 
 ## Key knobs (`src/config.py`)
 
-- `backbone` — `"retfound_dinov2"` (default; frozen ViT-L/14 + linear head) or the conv
-  backbones `"densenet121"` / `"resnet34"` / `"resnet50"` / `"mobilenet_v2"`.
-- `retfound_weights` / `retfound_arch` — RETFound encoder checkpoint path / DINOv2 arch.
-- `grid` — probing grid (default 8: DINOv2's 16×16 tokens pooled 2×2).
+- `backbone` — `"retfound_mae"` (frozen RETFound MAE ViT-L/16 + linear head).
+- `retfound_weights` / `retfound_arch` — RETFound encoder checkpoint path / timm arch.
+- `grid` — probing grid (default 7: MAE's 14×14 tokens pooled 2×2).
 - `n_train` / `n_val` — images/grade for fitting `W` / evaluating (caps; default 100 / 50).
 - `min_eval_images` — below this many correctly-diagnosed val images, evaluate on all val
   images (default 5).
-- `concept_mode` — `"per_class"` (default) or `"shared"`.
-- `concept_curated` — use each grade's vocab verbatim (default `True`); `False` runs the
-  paper's two-stage lexical+CLIP filter down to `r` concepts.
 - `flair_weights` — local FLAIR checkpoint path, or `None` to download the pretrained weights.
 
 ## Concept vocabulary
 
 [`concept_vocab.json`](concept_vocab.json), keyed per grade (`class_0_no_dr` …
 `class_4_proliferative_dr`), grouped by lesion category with optional `description`/`notes`
-metadata (ignored by the pipeline). With `concept_curated` (default) each grade's concepts are
-used **verbatim** — variable count, no filtering, no fixed-`r` skip. Keys resolve to the grade
-folders via `config.resolve_vocab_key` (tolerant of a `class_`/`grade_` prefix and of bare
-`0`–`4` folders via `CONCEPT_ALIASES`). Editing the file invalidates the concept cache.
+metadata (ignored by the pipeline). Each grade's concepts are used **verbatim** — every listed
+concept becomes a basis column, in order, with variable count per grade (no LLM, no
+lexical/CLIP filtering). Keys resolve to the grade folders via `config.resolve_vocab_key`
+(tolerant of a `class_`/`grade_` prefix and of bare `0`–`4` folders via `CONCEPT_ALIASES`).
+Editing the file invalidates the concept cache.

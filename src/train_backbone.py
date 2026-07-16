@@ -1,13 +1,11 @@
 """Train the DR-grading classifier head that LGMD then explains.
 
-LGMD explains a *trained classifier's* decisions, so before any concept discovery we need
-a backbone whose head predicts the DR severity grades. For the default RETFound (DINOv2)
-backbone this is a LINEAR PROBE: the foundation encoder is frozen and only a fresh
-Linear(feat_dim -> num_classes) head is trained (so CONFIG['backbone_weights'] stores just
-that head). For the torchvision conv backbones it is a full fine-tune from ImageNet inits.
-Either way it trains on an `n_per_class` subset of the train split, validates on the val
-split, and saves the best weights to CONFIG['backbone_weights'] — exactly where
-model_utils.load_backbone reads them.
+LGMD explains a *trained classifier's* decisions, so before any concept discovery we need a
+backbone whose head predicts the DR severity grades. This is a LINEAR PROBE: the RETFound
+(MAE ViT-L/16) foundation encoder is frozen and only a fresh Linear(feat_dim -> num_classes)
+head is trained (so CONFIG['backbone_weights'] stores just that head). It trains on an
+`n_per_class` subset of the train split, validates on the val split, and saves the best
+weights to CONFIG['backbone_weights'] — exactly where model_utils.load_backbone reads them.
 
 Usage (from the notebook, after the sys.path setup cell):
     import train_backbone
@@ -33,23 +31,13 @@ from config import CONFIG
 DEVICE = model_utils.DEVICE
 
 
-def _mean_std():
-    """ImageNet mean/std the active backbone was pretrained with (also used at LGMD time)."""
-    if CONFIG["backbone"].startswith("retfound"):
-        return model_utils._IMAGENET_MEAN, model_utils._IMAGENET_STD
-    _, weights = model_utils._BACKBONES[CONFIG["backbone"]]
-    base = weights.transforms()
-    return base.mean, base.std
-
-
 def _train_transform():
     """Light augmentation for training (random crop + flip), ImageNet normalization."""
-    mean, std = _mean_std()
     return Compose([
         RandomResizedCrop(224, scale=(0.7, 1.0)),
         RandomHorizontalFlip(),
         ToTensor(),
-        Normalize(mean, std),
+        Normalize(model_utils._IMAGENET_MEAN, model_utils._IMAGENET_STD),
     ])
 
 
@@ -81,7 +69,7 @@ def _evaluate(model, loader):
 
 
 def train(n_per_class=None, epochs=None, lr=None, batch_size=None, seed=None):
-    """Fine-tune the backbone on the fundus subset and save the best-val-acc weights.
+    """Linear-probe the DR-grading head on the fundus subset; save the best-val-acc head.
 
     All args default to the corresponding CONFIG knobs. Returns the path to the saved
     weights (CONFIG['backbone_weights']).
@@ -105,8 +93,8 @@ def train(n_per_class=None, epochs=None, lr=None, batch_size=None, seed=None):
     train_loader = DataLoader(subset, batch_size=batch_size, shuffle=True,
                               num_workers=2, pin_memory=True)
 
-    # Model: pretrained backbone (RETFound SSL encoder / ImageNet conv) + fresh head. Built
-    # once; its CLIP-aligned center-crop transform is what LGMD will also use at eval time.
+    # Model: frozen RETFound SSL encoder + fresh head. Built once; its FLAIR-aligned
+    # center-crop transform is what LGMD will also use at eval time.
     model, eval_transform = model_utils.build_backbone(pretrained=True)
 
     # Val split: same eval transform as above (and as LGMD later).
@@ -115,17 +103,13 @@ def train(n_per_class=None, epochs=None, lr=None, batch_size=None, seed=None):
     assert val_ds.classes == full_train.classes, "train/val class folders differ"
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
                             num_workers=2, pin_memory=True)
-    # RETFound linear probe: freeze the foundation encoder, train only the head.
-    is_retfound = CONFIG["backbone"].startswith("retfound")
-    if is_retfound:
-        for p in model.backbone.parameters():
-            p.requires_grad = False
-        params = model.head.parameters()
-        print(f"[train] RETFound linear probe: encoder frozen, training head "
-              f"({sum(p.numel() for p in model.head.parameters())} params).")
-    else:
-        params = model.parameters()
-    opt = torch.optim.Adam(params, lr=lr,
+
+    # Linear probe: freeze the foundation encoder, train only the head.
+    for p in model.backbone.parameters():
+        p.requires_grad = False
+    print(f"[train] RETFound linear probe: encoder frozen, training head "
+          f"({sum(p.numel() for p in model.head.parameters())} params).")
+    opt = torch.optim.Adam(model.head.parameters(), lr=lr,
                            weight_decay=CONFIG["train_weight_decay"])
     loss_fn = nn.CrossEntropyLoss()
 
@@ -133,8 +117,7 @@ def train(n_per_class=None, epochs=None, lr=None, batch_size=None, seed=None):
     best_acc = -1.0
     for ep in range(1, epochs + 1):
         model.train()
-        if is_retfound:
-            model.backbone.eval()   # frozen encoder: no drop-path / train-mode noise
+        model.backbone.eval()   # frozen encoder: no drop-path / train-mode noise
         running = 0.0
         pbar = tqdm(train_loader, desc=f"epoch {ep}/{epochs}")
         for x, y in pbar:
@@ -149,8 +132,7 @@ def train(n_per_class=None, epochs=None, lr=None, batch_size=None, seed=None):
         print(f"epoch {ep}: train_loss={running / len(subset):.4f}  val_acc={val_acc:.4f}")
         if val_acc > best_acc:
             best_acc = val_acc
-            # RETFound: save only the trained head (encoder comes from retfound_weights).
-            torch.save(model.head.state_dict() if is_retfound else model.state_dict(), wpath)
+            torch.save(model.head.state_dict(), wpath)   # save only the trained head
             print(f"  [save] new best val_acc={best_acc:.4f} -> {os.path.basename(wpath)}")
 
     print(f"done. best val_acc={best_acc:.4f}; weights at {wpath}")
