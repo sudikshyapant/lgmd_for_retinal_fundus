@@ -49,7 +49,14 @@ class RETFoundMAE(nn.Module):
                 f"RETFound encoder weights not found at {path}. Set "
                 f"CONFIG['retfound_weights'] to the downloaded RETFound_mae_natureCFP checkpoint."
             )
-        sd = torch.load(path, map_location="cpu")
+        # weights_only=False: the RETFound checkpoint bundles an argparse.Namespace (its
+        # training args), which PyTorch 2.6's default safe loader (weights_only=True) rejects.
+        # Safe here — this is the trusted official RETFound encoder file. The try/except keeps
+        # it working on older torch (<1.13) that lacks the weights_only argument.
+        try:
+            sd = torch.load(path, map_location="cpu", weights_only=False)
+        except TypeError:
+            sd = torch.load(path, map_location="cpu")
         sd = sd.get("model", sd.get("teacher", sd.get("state_dict", sd)))  # unwrap common containers
         sd = {k.replace("backbone.", "").replace("module.", ""): v for k, v in sd.items()}
         # Keep only keys that exist in the target with a matching shape — robust across
