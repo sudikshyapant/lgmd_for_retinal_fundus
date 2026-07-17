@@ -31,12 +31,24 @@ from config import (CONFIG, FIGURE_CLASSES, cache_name, select_class,
 DEVICE = model_utils.DEVICE
 
 
+def nonneg_offset(A):
+    """Per-channel min of activations A (N, p) -> shift vector (p,).
+
+    NMF needs a non-negative matrix, but RETFound's ViT tokens are signed. Subtracting this
+    per-channel min moves the activations into the non-negative orthant for factorization;
+    lgmd.reconstruct adds it back so the classifier head still reads original-space features
+    (the shift is a constant offset, reproduced exactly, so predictions are unchanged).
+    """
+    return A.min(dim=0).values
+
+
 def class_basis(name, model, transform, vlm):
     """Steps 1-5 of run_class: fit (or load) one class's concept basis.
 
-    Returns (concepts, W, Z_train) — the class concept list, its learned semantic basis W,
-    and the train-split activations (shape reused for baselines). Cache keys are identical
-    to run_class's, so run_class and the lesion-localization eval share the same artifacts.
+    Returns (concepts, W, Z_train, offset) — the class concept list, its learned semantic
+    basis W, the train-split activations (shape reused for baselines), and the non-negative
+    shift applied before factorization. Cache keys are identical to run_class's, so run_class
+    and the lesion-localization eval share the same artifacts.
     """
     select_class(name)                                  # sets class_name / index
     CDIR, seed, cls = CONFIG["cache_dir"], CONFIG["seed"], CONFIG["class_name"]
@@ -51,10 +63,14 @@ def class_basis(name, model, transform, vlm):
     S_train = utils.cached(os.path.join(CDIR, cache_name("S_train", ".pt", "data", "con", "clip")),
         lambda: flair_maps.build_S(train_imgs, concept_list, vlm))
 
-    # 5. fit semantic concept basis W via PGD (cache key: data + model + con + clip + pgd)
+    # 5. shift to the non-negative orthant, then fit the concept basis W via PGD
+    #    (cache key: data + model + con + clip + pgd). The offset is deterministic from
+    #    Z_train (data + model), so it is recomputed rather than separately cached.
+    A_train = lgmd.unfold(Z_train)
+    offset = nonneg_offset(A_train)
     W = utils.cached(os.path.join(CDIR, cache_name("W", ".pt", "data", "model", "con", "clip", "pgd")),
-        lambda: lgmd.fit_basis(lgmd.unfold(Z_train), S_train))
-    return concept_list, W, Z_train
+        lambda: lgmd.fit_basis(A_train - offset, S_train))
+    return concept_list, W, Z_train, offset
 
 
 def run_class(name, model, transform, vlm, make_figures=False):
@@ -63,10 +79,10 @@ def run_class(name, model, transform, vlm, make_figures=False):
     `model`, `transform`, `vlm` are the shared (class-independent) backbone and VLM.
     Set `make_figures` to also save concept-overlay images for this class.
     """
-    concept_list, W, Z_train = class_basis(name, model, transform, vlm)
+    concept_list, W, Z_train, offset = class_basis(name, model, transform, vlm)
     CDIR, RDIR, bb = CONFIG["cache_dir"], CONFIG["results_dir"], CONFIG["backbone"]
     cls, label, seed = CONFIG["class_name"], CONFIG["class_index"], CONFIG["seed"]
-    A_train = lgmd.unfold(Z_train)
+    A_train = lgmd.unfold(Z_train) - offset             # non-negative feature space (all methods)
 
     # val data + activations (cache key: data + model)
     val_imgs = data_utils.load_class_images(cls, CONFIG["n_val"], "val_dir", seed)
@@ -93,17 +109,17 @@ def run_class(name, model, transform, vlm, make_figures=False):
     Z_val = Z_val[eval_mask]
     val_imgs = [im for im, k in zip(val_imgs, eval_mask.tolist()) if k]
     n_eval = len(val_imgs)                               # images actually scored below
-    A_val = lgmd.unfold(Z_val)
+    A_val = lgmd.unfold(Z_val) - offset                 # shift into the non-negative space
     orig_logits = orig_logits_full[eval_mask]
     S_hat = lgmd.infer(A_val, W)
-    A_hat = lgmd.reconstruct(S_hat, W, Z_val.shape)
+    A_hat = lgmd.reconstruct(S_hat, W, Z_val.shape, offset)   # offset added back -> original space
 
     def _lgmd_metrics():
         recon_logits = model_utils.logits_from_Z(model, A_hat)
         return {
             **metrics.predictive_preservation(orig_logits, recon_logits, label),
             "kl": metrics.kl_logits(orig_logits, recon_logits),
-            "recon_err": metrics.recon_error(A_val, lgmd.unfold(A_hat)),
+            "recon_err": metrics.recon_error(A_val, lgmd.unfold(A_hat) - offset),
         }
 
     lgmd_metrics = utils.cached_json(
@@ -111,9 +127,12 @@ def run_class(name, model, transform, vlm, make_figures=False):
                                       "data", "model", "con", "clip", "pgd", "infer")),
         _lgmd_metrics)
 
-    # 7. baseline comparison: ICE / CRAFT / FACE vs LGMD (Acc + C-Ins)
+    # 7. baseline comparison: ICE / CRAFT / FACE vs LGMD (Acc + C-Ins). All baselines fit in
+    #    the same shifted non-negative space as LGMD. face_head adds the offset back so FACE's
+    #    KL term is computed against the original classifier's logits.
     R = len(concept_list)                               # basis columns = number of concepts
-    face_head = lambda a: model_utils.classify_pooled(model, a.to(DEVICE))
+    offset_dev = offset.to(DEVICE)
+    face_head = lambda a: model_utils.classify_pooled(model, a.to(DEVICE) + offset_dev)
     head_fn = lambda Z: model_utils.logits_from_Z(model, Z)
 
     # Fit the baseline bases once and cache them (reused for metrics AND figures).
@@ -132,16 +151,16 @@ def run_class(name, model, transform, vlm, make_figures=False):
         out = {}
         for bn, Wb in bases.items():
             Sb = lgmd.infer(A_val, Wb)
-            Ab = lgmd.reconstruct(Sb, Wb, Z_val.shape)
+            Ab = lgmd.reconstruct(Sb, Wb, Z_val.shape, offset)   # original space
             lg = model_utils.logits_from_Z(model, Ab)
-            cur = metrics.insertion_curve(Sb, Wb, Z_val.shape, head_fn, label)
+            cur = metrics.insertion_curve(Sb, Wb, Z_val.shape, head_fn, label, offset=offset)
             pp = metrics.predictive_preservation(orig_logits, lg, label)
             out[bn] = {
                 "Acc": pp["recon_acc"],
                 "C-Ins": metrics.insertion_auc(cur),
                 "agreement": pp["agreement"],
                 "kl": metrics.kl_logits(orig_logits, lg),
-                "recon_err": metrics.recon_error(A_val, lgmd.unfold(Ab)),
+                "recon_err": metrics.recon_error(A_val, lgmd.unfold(Ab) - offset),
             }
         return out
 

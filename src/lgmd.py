@@ -2,6 +2,12 @@
 
 Training (Sec 3.4):   min_{W>=0} 1/2 ||A_bar - S W^T||_F^2     (S fixed, learn W)
 Inference (Sec 3.5):  min_{S_hat>=0} 1/2 ||S_hat W^T - A_bar||_F^2  (W fixed, learn S_hat)
+
+NMF assumes a NON-NEGATIVE activation matrix A_bar. Conv+ReLU encoders give that for free,
+but a ViT encoder (RETFound) emits signed, LayerNorm-normalized tokens. The caller (runner)
+therefore shifts activations to the non-negative orthant by their per-channel min before
+fitting, and `reconstruct` adds that offset back so the head still sees original-space
+features. So the A passed to fit_basis / infer here is already the shifted, non-negative one.
 """
 
 import torch
@@ -68,8 +74,16 @@ def infer(A, W, refine=True):
     return S_hat.cpu()
 
 
-def reconstruct(S_hat, W, shape):
-    """A_hat = S_hat W^T, reshaped back to a spatial feature map (n, p, h, w)."""
+def reconstruct(S_hat, W, shape, offset=None):
+    """A_hat = S_hat W^T (+ offset), reshaped back to a spatial feature map (n, p, h, w).
+
+    `offset` (per-channel, shape (p,)) is the non-negative shift the activations were
+    reduced by before factorization (see runner). Adding it back lands the reconstruction
+    in the ORIGINAL activation space — the space the classifier head reads — so the head
+    can be applied directly with no change. Omit it to stay in the shifted space.
+    """
     n, p, h, w = shape
     A_hat = S_hat @ W.T
+    if offset is not None:
+        A_hat = A_hat + offset                          # per-channel broadcast over locations
     return A_hat.reshape(n, h, w, p).permute(0, 3, 1, 2)

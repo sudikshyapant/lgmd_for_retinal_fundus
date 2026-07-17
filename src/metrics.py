@@ -42,13 +42,15 @@ def mse(A, A_hat):
 
 
 @torch.no_grad()
-def insertion_curve(S_hat, W, shape, head_fn, label, metric=None):
+def insertion_curve(S_hat, W, shape, head_fn, label, offset=None, metric=None):
     """C-Insertion curve over concepts, ordered by importance (paper §4.2).
 
     Importance = total activation mass per concept. Concepts are added most-important-first
     (steep early rise = faithful): starting from an empty coefficient matrix, we add one
     concept at a time and record model performance.
 
+    `offset` (per-channel, shape (p,)) is the non-negative shift the activations were reduced
+    by before factorization; it is added back so the head reads original-space features.
     `metric` ("prob" | "accuracy", default CONFIG["cins_metric"]) selects how "model
     performance" is measured at each step: mean true-class probability, or accuracy.
     """
@@ -57,7 +59,10 @@ def insertion_curve(S_hat, W, shape, head_fn, label, metric=None):
     order = torch.argsort(S_hat.sum(0), descending=True)   # concept importance
 
     def true_prob(S):
-        A_hat = (S @ W.T).reshape(n, h, w, p).permute(0, 3, 1, 2)
+        A_hat = S @ W.T
+        if offset is not None:
+            A_hat = A_hat + offset
+        A_hat = A_hat.reshape(n, h, w, p).permute(0, 3, 1, 2)
         logits = head_fn(A_hat)
         if metric == "accuracy":
             return float((logits.argmax(-1) == label).float().mean())

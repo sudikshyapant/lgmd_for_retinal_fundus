@@ -117,7 +117,7 @@ def run_localization(root=None, class_name="2_moderate_npdr", limit=None,
     """
     model, transform = model_utils.load_backbone()
     vlm = flair_maps.VLM()
-    concepts, W, _ = runner.class_basis(class_name, model, transform, vlm)
+    concepts, W, _, offset = runner.class_basis(class_name, model, transform, vlm)
     label = CONFIG["class_index"]
 
     root = download(root)
@@ -135,7 +135,7 @@ def run_localization(root=None, class_name="2_moderate_npdr", limit=None,
             raise RuntimeError(f"No IDRiD image was diagnosed as '{class_name}'.")
 
     grid, r = CONFIG["grid"], len(concepts)
-    S = lgmd.infer(lgmd.unfold(Z), W).reshape(len(records), grid * grid, r)
+    S = lgmd.infer(lgmd.unfold(Z) - offset, W).reshape(len(records), grid * grid, r)
 
     per_concept = {}
     for i, (_ipath, mdict) in enumerate(records):
