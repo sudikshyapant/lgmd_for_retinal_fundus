@@ -41,6 +41,15 @@ def fit_basis(A, S):
     back to the non-negative orthant after each step (Eq. 2).
     """
     r = S.shape[1]
+    a_min = float(A.min())
+    if a_min < 0:
+        raise ValueError(
+            f"fit_basis received an activation matrix with negative values (min={a_min:.4g}). "
+            "NMF/NNDSVD needs a non-negative A. Shift it into the non-negative orthant first, "
+            "e.g. `offset = A_train.min(dim=0).values; A_train = A_train - offset` (see the "
+            "activations cell), and pass the shifted matrix. Re-run that cell in this kernel — "
+            "reloading modules does not re-shift an A_train already in memory."
+        )
     W = _nndsvd_init(A, r).to(DEVICE)
     A, S = A.to(DEVICE), S.to(DEVICE)
 
